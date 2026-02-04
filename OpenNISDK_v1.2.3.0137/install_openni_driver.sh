@@ -92,6 +92,7 @@ ln -sf "${OPENNI2_DRIVER_DIR}/libcsdevice.so" "${OPENNI2_DRIVER_DIR}/libcsdevice
 # 8. Install Udev Rules
 echo -e "${YELLOW}[5/6] Setting up USB Rules...${NC}"
 if [ -f "${SCRIPT_PATH}/rules/cs_uvc.rules" ]; then
+    mkdir -p /etc/udev/rules.d
     cp "${SCRIPT_PATH}/rules/cs_uvc.rules" /etc/udev/rules.d/cs_uvc.rules
     udevadm control --reload-rules && udevadm trigger
 else
