@@ -5,6 +5,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "rclcpp/rclcpp.hpp"
@@ -21,6 +22,8 @@
 #include "tf2_ros/static_transform_broadcaster.h"
 
 #include "3DCamera.hpp"
+#include "h/camera.h"
+#include "h/system.h"
 
 using namespace std::chrono_literals;
 
@@ -35,16 +38,8 @@ public:
   {
     serial_ = declare_parameter<std::string>("serial", "");
 
-    depth_mode_ = declare_parameter<std::string>("depth_mode", "");
-    rgb_mode_ = declare_parameter<std::string>("rgb_mode", "");
-
-    depth_width_ = declare_parameter<int>("depth_width", 0);
-    depth_height_ = declare_parameter<int>("depth_height", 0);
-    depth_fps_ = declare_parameter<double>("depth_fps", 0.0);
-
-    rgb_width_ = declare_parameter<int>("rgb_width", 0);
-    rgb_height_ = declare_parameter<int>("rgb_height", 0);
-    rgb_fps_ = declare_parameter<double>("rgb_fps", 0.0);
+    depth_profile_ = declare_parameter<std::string>("depth_profile", "");
+    rgb_profile_ = declare_parameter<std::string>("rgb_profile", "");
 
     depth_frame_id_ = declare_parameter<std::string>("depth_frame_id", "revo_depth_optical_frame");
     rgb_frame_id_ = declare_parameter<std::string>("rgb_frame_id", "revo_rgb_optical_frame");
@@ -59,9 +54,26 @@ public:
     depth_auto_exposure_ = declare_parameter<bool>("depth_auto_exposure", false);
     depth_exposure_us_ = declare_parameter<double>("depth_exposure_us", 3000.0);
     depth_frame_time_us_ = declare_parameter<double>("depth_frame_time_us", 7500.0);
+    depth_gain_ = declare_parameter<double>("depth_gain", 1.0);
+    trigger_mode_ = declare_parameter<int>("trigger_mode", static_cast<int>(TRIGGER_MODE_OFF));
+    depth_rgb_match_threshold_ = declare_parameter<int>("depth_rgb_match_threshold", 0);
+    depth_rgb_match_rgb_offset_ = declare_parameter<int>("depth_rgb_match_rgb_offset", 0);
+    depth_rgb_match_force_rgb_after_depth_ = declare_parameter<bool>(
+      "depth_rgb_match_force_rgb_after_depth", false);
+
+    initial_reset_ = declare_parameter<bool>("initial_reset", false);
+    clear_frame_buffer_ = declare_parameter<bool>("clear_frame_buffer", false);
 
     laser_enable_ = declare_parameter<bool>("laser_enable", true);
     laser_luminance_ = declare_parameter<int>("laser_luminance", 100);
+
+    ir_led_enable_ = declare_parameter<bool>("ir_led_enable", false);
+    ir_led_luminance_ = declare_parameter<int>("ir_led_luminance", 0);
+    rgb_led_mode_ = declare_parameter<std::string>("rgb_led_mode", "disable");
+
+    depth_range_min_mm_ = declare_parameter<int>("depth_range_min_mm", 0);
+    depth_range_max_mm_ = declare_parameter<int>("depth_range_max_mm", 0);
+    algorithm_contrast_ = declare_parameter<int>("algorithm_contrast", 0);
 
     publish_pointcloud_ = declare_parameter<bool>("publish_pointcloud", false);
 
@@ -71,7 +83,8 @@ public:
     rgb_info_pub_ = create_publisher<sensor_msgs::msg::CameraInfo>("rgb/camera_info", rclcpp::SensorDataQoS());
     if (publish_pointcloud_)
     {
-      cloud_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>("points", rclcpp::SensorDataQoS());
+      cloud_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>(
+        "points", rclcpp::QoS(rclcpp::KeepLast(10)).reliable());
     }
 
     depth_info_manager_ = std::make_shared<camera_info_manager::CameraInfoManager>(this, "depth", depth_info_url_);
@@ -91,6 +104,165 @@ public:
   }
 
 private:
+  bool hardware_reset(const CameraInfo * info)
+  {
+    CSystem * sys = createSystem();
+    if (!sys)
+    {
+      RCLCPP_WARN(get_logger(), "Hardware reset: failed to create C system context");
+      return false;
+    }
+
+    CameraInfo temp{};
+    if (!serial_.empty())
+    {
+      std::strncpy(temp.serial, serial_.c_str(), sizeof(temp.serial) - 1);
+      temp.serial[sizeof(temp.serial) - 1] = '\0';
+    }
+
+    CameraInfo * connect_info = info ? const_cast<CameraInfo *>(info) : &temp;
+    CCamera * cam = systemConnectCamera(sys, connect_info);
+    if (!cam)
+    {
+      RCLCPP_WARN(get_logger(), "Hardware reset: failed to connect C camera");
+      deleteSystem(sys);
+      return false;
+    }
+
+    ERROR_CODE ret = cameraReset(cam);
+    systemDisconnectCamera(sys, cam);
+    deleteSystem(sys);
+
+    if (ret != SUCCESS)
+    {
+      RCLCPP_WARN(get_logger(), "Hardware reset request failed (ret=%d)", ret);
+      return false;
+    }
+
+    RCLCPP_INFO(get_logger(), "Hardware reset request sent");
+    return true;
+  }
+
+  bool wait_for_stream_infos(int retries, std::chrono::milliseconds delay)
+  {
+    for (int i = 0; i < retries; ++i)
+    {
+      std::vector<StreamInfo> depth_infos;
+      std::vector<StreamInfo> rgb_infos;
+      ERROR_CODE ret_depth = camera_->getStreamInfos(STREAM_TYPE_DEPTH, depth_infos);
+      ERROR_CODE ret_rgb = camera_->getStreamInfos(STREAM_TYPE_RGB, rgb_infos);
+      if (ret_depth == SUCCESS && ret_rgb == SUCCESS &&
+        !depth_infos.empty() && !rgb_infos.empty())
+      {
+        return true;
+      }
+
+      RCLCPP_WARN(get_logger(),
+        "Stream infos not ready (depth ret=%d count=%zu, rgb ret=%d count=%zu), retry %d/%d",
+        ret_depth, depth_infos.size(), ret_rgb, rgb_infos.size(), i + 1, retries);
+      std::this_thread::sleep_for(delay);
+    }
+    return false;
+  }
+
+  bool reconnect_after_restart(const std::string & serial, CameraInfo * connected_info)
+  {
+    camera_.reset();
+    cs::ISystemPtr system = cs::getSystemPtr();
+
+    for (int i = 0; i < 20; ++i)
+    {
+      std::vector<CameraInfo> cameras;
+      ERROR_CODE ret = system->queryCameras(cameras);
+      if (ret == SUCCESS && !cameras.empty())
+      {
+        CameraInfo selected = cameras[0];
+        if (!serial.empty())
+        {
+          for (const auto & info : cameras)
+          {
+            if (serial == info.serial)
+            {
+              selected = info;
+              break;
+            }
+          }
+        }
+
+        camera_ = cs::getCameraPtr();
+        ret = serial.empty() ? camera_->connect() : camera_->connect(selected);
+        if (ret == SUCCESS)
+        {
+          if (connected_info)
+          {
+            *connected_info = selected;
+          }
+          return true;
+        }
+      }
+
+      std::this_thread::sleep_for(500ms);
+    }
+
+    camera_ = cs::getCameraPtr();
+    ERROR_CODE ret = camera_->connect();
+    if (ret == SUCCESS)
+    {
+      if (connected_info)
+      {
+        camera_->getInfo(*connected_info);
+      }
+      return true;
+    }
+
+    return false;
+  }
+
+  bool restart_and_reconnect(const std::string & serial, CameraInfo * connected_info)
+  {
+    ERROR_CODE ret = camera_->restart();
+    if (ret != SUCCESS)
+    {
+      RCLCPP_WARN(get_logger(), "Camera restart failed (ret=%d)", ret);
+      return false;
+    }
+
+    camera_->disconnect();
+    std::this_thread::sleep_for(8s);
+
+    for (int attempt = 0; attempt < 5; ++attempt)
+    {
+      if (!reconnect_after_restart(serial, connected_info))
+      {
+        std::this_thread::sleep_for(1s);
+        continue;
+      }
+
+      CameraInfo info_check{};
+      if (camera_->getInfo(info_check) != SUCCESS)
+      {
+        RCLCPP_WARN(get_logger(), "Camera connected but info not ready, retry %d/5", attempt + 1);
+        camera_->disconnect();
+        std::this_thread::sleep_for(1s);
+        continue;
+      }
+
+      if (!wait_for_stream_infos(10, 500ms))
+      {
+        RCLCPP_WARN(get_logger(), "Stream infos not ready after reconnect, retry %d/5", attempt + 1);
+        camera_->disconnect();
+        std::this_thread::sleep_for(1s);
+        continue;
+      }
+
+      log_camera_info();
+      return true;
+    }
+
+    RCLCPP_ERROR(get_logger(), "Failed to reconnect and get stream infos after restart");
+    return false;
+  }
+
   bool start_camera()
   {
     cs::ISystemPtr system = cs::getSystemPtr();
@@ -107,20 +279,53 @@ private:
         return false;
       }
 
+      log_camera_info();
+
+      if (initial_reset_)
+      {
+        RCLCPP_WARN(get_logger(), "Initial reset requested: restarting camera");
+        if (!restart_and_reconnect(serial_, nullptr))
+        {
+          return false;
+        }
+      }
+
+      if (clear_frame_buffer_)
+      {
+        PropertyExtension clear;
+        clear.streamType = STREAM_TYPE_DEPTH;
+        if (camera_->setPropertyExtension(PROPERTY_EXT_CLEAR_FRAME_BUFFER, clear) != SUCCESS)
+        {
+          RCLCPP_WARN(get_logger(), "Failed to clear depth frame buffer");
+        }
+        clear.streamType = STREAM_TYPE_RGB;
+        if (camera_->setPropertyExtension(PROPERTY_EXT_CLEAR_FRAME_BUFFER, clear) != SUCCESS)
+        {
+          RCLCPP_WARN(get_logger(), "Failed to clear RGB frame buffer");
+        }
+      }
+
+      if (!initial_reset_ && !wait_for_stream_infos(10, 500ms))
+      {
+        RCLCPP_ERROR(get_logger(), "Depth/RGB stream infos not available after reconnect");
+        return false;
+      }
+
       if (!select_streams())
       {
         return false;
       }
 
-      ret = camera_->startStream(depth_stream_info_, rgb_stream_info_, &RevopointCameraNode::frame_pair_callback, this);
-      if (ret != SUCCESS)
+      if (!start_streams())
       {
-        RCLCPP_ERROR(get_logger(), "Start stream failed (ret=%d)", ret);
+        RCLCPP_ERROR(get_logger(), "Failed to start streams");
         return false;
       }
 
       configure_depth_exposure();
       configure_laser();
+      configure_leds();
+      configure_depth_controls();
       update_camera_info();
 
       return true;
@@ -153,20 +358,53 @@ private:
       return false;
     }
 
+    log_camera_info();
+
+    if (initial_reset_)
+    {
+      RCLCPP_WARN(get_logger(), "Initial reset requested: restarting camera");
+      if (!restart_and_reconnect(serial_, &selected))
+      {
+        return false;
+      }
+    }
+
+    if (clear_frame_buffer_)
+    {
+      PropertyExtension clear;
+      clear.streamType = STREAM_TYPE_DEPTH;
+      if (camera_->setPropertyExtension(PROPERTY_EXT_CLEAR_FRAME_BUFFER, clear) != SUCCESS)
+      {
+        RCLCPP_WARN(get_logger(), "Failed to clear depth frame buffer");
+      }
+      clear.streamType = STREAM_TYPE_RGB;
+      if (camera_->setPropertyExtension(PROPERTY_EXT_CLEAR_FRAME_BUFFER, clear) != SUCCESS)
+      {
+        RCLCPP_WARN(get_logger(), "Failed to clear RGB frame buffer");
+      }
+    }
+
+    if (!initial_reset_ && !wait_for_stream_infos(10, 500ms))
+    {
+      RCLCPP_ERROR(get_logger(), "Depth/RGB stream infos not available after reconnect");
+      return false;
+    }
+
     if (!select_streams())
     {
       return false;
     }
 
-    ret = camera_->startStream(depth_stream_info_, rgb_stream_info_, &RevopointCameraNode::frame_pair_callback, this);
-    if (ret != SUCCESS)
+    if (!start_streams())
     {
-      RCLCPP_ERROR(get_logger(), "Start stream failed (ret=%d)", ret);
+      RCLCPP_ERROR(get_logger(), "Failed to start streams");
       return false;
     }
 
     configure_depth_exposure();
     configure_laser();
+    configure_leds();
+    configure_depth_controls();
     update_camera_info();
 
     return true;
@@ -201,44 +439,90 @@ private:
       return false;
     }
 
-    int depth_w = depth_width_;
-    int depth_h = depth_height_;
-    double depth_fps = depth_fps_;
-    if (!depth_mode_.empty())
-    {
-      if (!parse_mode_string(depth_mode_, depth_w, depth_h, depth_fps))
-      {
-        RCLCPP_WARN(get_logger(), "Invalid depth_mode '%s', falling back to width/height/fps", depth_mode_.c_str());
-      }
-    }
-
-    if (!pick_stream(depth_infos, STREAM_FORMAT_Z16, depth_w, depth_h, depth_fps, depth_stream_info_))
+    if (!select_depth_stream(depth_infos))
     {
       RCLCPP_ERROR(get_logger(), "No suitable depth stream found");
       return false;
     }
 
-    int rgb_w = rgb_width_;
-    int rgb_h = rgb_height_;
-    double rgb_fps = rgb_fps_;
-    if (!rgb_mode_.empty())
-    {
-      if (!parse_mode_string(rgb_mode_, rgb_w, rgb_h, rgb_fps))
-      {
-        RCLCPP_WARN(get_logger(), "Invalid rgb_mode '%s', falling back to width/height/fps", rgb_mode_.c_str());
-      }
-    }
-
-    if (!pick_stream(rgb_infos, STREAM_FORMAT_RGB8, rgb_w, rgb_h, rgb_fps, rgb_stream_info_))
+    if (!select_rgb_stream(rgb_infos))
     {
       RCLCPP_ERROR(get_logger(), "No suitable RGB stream found");
+      return false;
+    }
+
+    log_stream_info("depth", depth_stream_info_);
+    log_stream_info("rgb", rgb_stream_info_);
+
+    return true;
+  }
+
+  void log_camera_info()
+  {
+    CameraInfo info;
+    if (camera_->getInfo(info) != SUCCESS)
+    {
+      RCLCPP_WARN(get_logger(), "Failed to read camera info");
+      return;
+    }
+
+    last_camera_info_ = info;
+    has_camera_info_ = true;
+
+    RCLCPP_INFO(get_logger(), "Camera connected: name=%s serial=%s unique_id=%s fw=%s algo=%s",
+      info.name, info.serial, info.uniqueId, info.firmwareVersion, info.algorithmVersion);
+  }
+
+  void log_stream_info(const std::string & label, const StreamInfo & info)
+  {
+    RCLCPP_INFO(get_logger(), "Stream %s: format=%d %dx%d @ %.1f Hz",
+      label.c_str(), static_cast<int>(info.format), info.width, info.height, info.fps);
+  }
+
+  bool start_streams()
+  {
+    ERROR_CODE ret = camera_->startStream(depth_stream_info_, rgb_stream_info_, &RevopointCameraNode::frame_pair_callback, this);
+    if (ret == SUCCESS)
+    {
+      return true;
+    }
+
+    RCLCPP_WARN(get_logger(), "Paired stream start failed (ret=%d), falling back to sequential start", ret);
+
+    ret = camera_->startStream(STREAM_TYPE_DEPTH, depth_stream_info_, nullptr, nullptr);
+    if (ret != SUCCESS)
+    {
+      RCLCPP_ERROR(get_logger(), "Depth stream start failed (ret=%d)", ret);
+      return false;
+    }
+
+    ret = camera_->startStream(STREAM_TYPE_RGB, rgb_stream_info_, nullptr, nullptr);
+    if (ret != SUCCESS)
+    {
+      RCLCPP_ERROR(get_logger(), "RGB stream start failed (ret=%d)", ret);
+      camera_->stopStream(STREAM_TYPE_DEPTH);
       return false;
     }
 
     return true;
   }
 
-  bool pick_stream(
+  bool parse_profile_string(const std::string & profile, int & width, int & height, double & fps)
+  {
+    int w = 0;
+    int h = 0;
+    double f = 0.0;
+    if (sscanf(profile.c_str(), "%dx%dx%lf", &w, &h, &f) == 3)
+    {
+      width = w;
+      height = h;
+      fps = f;
+      return true;
+    }
+    return false;
+  }
+
+  bool pick_profile_stream(
     const std::vector<StreamInfo> & infos,
     STREAM_FORMAT format,
     int width,
@@ -253,43 +537,163 @@ private:
         continue;
       }
 
-      if (width > 0 && info.width != width)
+      if (info.width != width || info.height != height)
       {
         continue;
       }
 
-      if (height > 0 && info.height != height)
-      {
-        continue;
-      }
-
-      if (fps > 0.0 && std::abs(info.fps - fps) > 0.5)
+      // Some devices report 0.0 Hz; treat as "unknown" and accept.
+      if (info.fps > 0.0 && fps > 0.0 && std::abs(info.fps - fps) > 0.5)
       {
         continue;
       }
 
       out = info;
+      // Preserve requested fps if device reports 0.
+      if (out.fps <= 0.0 && fps > 0.0)
+      {
+        out.fps = fps;
+      }
       return true;
     }
 
-    out = infos.front();
-    return out.format == format;
+    return false;
   }
 
-  bool parse_mode_string(const std::string & mode, int & width, int & height, double & fps)
+  bool select_depth_stream(const std::vector<StreamInfo> & depth_infos)
   {
-    int w = 0;
-    int h = 0;
-    double f = 0.0;
-    if (sscanf(mode.c_str(), "%dx%d@%lfHz", &w, &h, &f) == 3 ||
-        sscanf(mode.c_str(), "%dx%d@%lf", &w, &h, &f) == 3)
+    log_available_streams("depth", depth_infos);
+
+    if (depth_profile_.empty())
     {
-      width = w;
-      height = h;
-      fps = f;
+      for (const auto & info : depth_infos)
+      {
+        if (info.format == STREAM_FORMAT_Z16)
+        {
+          depth_stream_info_ = info;
+          RCLCPP_INFO(get_logger(), "Using device default depth stream %dx%d @ %.1f Hz",
+            info.width, info.height, info.fps);
+          return true;
+        }
+      }
+      return false;
+    }
+
+    if (!depth_profile_.empty())
+    {
+      int w = 0;
+      int h = 0;
+      double f = 0.0;
+      if (!parse_profile_string(depth_profile_, w, h, f))
+      {
+        RCLCPP_WARN(get_logger(), "Invalid depth_profile '%s' (expected WxHxF)", depth_profile_.c_str());
+      }
+      else
+      {
+        if (depth_profile_ != "1600x1200x6" && depth_profile_ != "800x600x12")
+        {
+          RCLCPP_WARN(get_logger(), "Depth profile '%s' is not a default option; attempting to set anyway", depth_profile_.c_str());
+        }
+        if (pick_profile_stream(depth_infos, STREAM_FORMAT_Z16, w, h, f, depth_stream_info_))
+        {
+          return true;
+        }
+        RCLCPP_WARN(get_logger(), "Requested depth profile not found, falling back to defaults");
+      }
+    }
+
+    if (pick_profile_stream(depth_infos, STREAM_FORMAT_Z16, 1600, 1200, 6.0, depth_stream_info_))
+    {
       return true;
     }
+
+    if (pick_profile_stream(depth_infos, STREAM_FORMAT_Z16, 800, 600, 12.0, depth_stream_info_))
+    {
+      return true;
+    }
+
+    for (const auto & info : depth_infos)
+    {
+      if (info.format == STREAM_FORMAT_Z16)
+      {
+        RCLCPP_WARN(get_logger(), "Falling back to first available depth Z16 stream %dx%d @ %.1f Hz",
+          info.width, info.height, info.fps);
+        depth_stream_info_ = info;
+        return true;
+      }
+    }
+
     return false;
+  }
+
+  bool select_rgb_stream(const std::vector<StreamInfo> & rgb_infos)
+  {
+    log_available_streams("rgb", rgb_infos);
+
+    if (rgb_profile_.empty())
+    {
+      for (const auto & info : rgb_infos)
+      {
+        if (info.format == STREAM_FORMAT_RGB8)
+        {
+          rgb_stream_info_ = info;
+          RCLCPP_INFO(get_logger(), "Using device default RGB stream %dx%d @ %.1f Hz",
+            info.width, info.height, info.fps);
+          return true;
+        }
+      }
+      return false;
+    }
+
+    if (!rgb_profile_.empty())
+    {
+      int w = 0;
+      int h = 0;
+      double f = 0.0;
+      if (!parse_profile_string(rgb_profile_, w, h, f))
+      {
+        RCLCPP_WARN(get_logger(), "Invalid rgb_profile '%s' (expected WxHxF)", rgb_profile_.c_str());
+      }
+      else
+      {
+        if (rgb_profile_ != "1600x1200x20")
+        {
+          RCLCPP_WARN(get_logger(), "RGB profile '%s' is not a default option; attempting to set anyway", rgb_profile_.c_str());
+        }
+        if (pick_profile_stream(rgb_infos, STREAM_FORMAT_RGB8, w, h, f, rgb_stream_info_))
+        {
+          return true;
+        }
+        RCLCPP_WARN(get_logger(), "Requested RGB profile not found, falling back to defaults");
+      }
+    }
+
+    if (pick_profile_stream(rgb_infos, STREAM_FORMAT_RGB8, 1600, 1200, 20.0, rgb_stream_info_))
+    {
+      return true;
+    }
+
+    for (const auto & info : rgb_infos)
+    {
+      if (info.format == STREAM_FORMAT_RGB8)
+      {
+        RCLCPP_WARN(get_logger(), "Falling back to first available RGB8 stream %dx%d @ %.1f Hz",
+          info.width, info.height, info.fps);
+        rgb_stream_info_ = info;
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  void log_available_streams(const std::string & label, const std::vector<StreamInfo> & infos)
+  {
+    for (const auto & info : infos)
+    {
+      RCLCPP_INFO(get_logger(), "Available %s stream: format=%d %dx%d @ %.1f Hz",
+        label.c_str(), static_cast<int>(info.format), info.width, info.height, info.fps);
+    }
   }
 
   void configure_depth_exposure()
@@ -298,10 +702,40 @@ private:
     auto_exp.autoExposureMode = depth_auto_exposure_ ? AUTO_EXPOSURE_MODE::AUTO_EXPOSURE_MODE_FIX_FRAMETIME
                              : AUTO_EXPOSURE_MODE::AUTO_EXPOSURE_MODE_CLOSE;
 
-    ERROR_CODE ret = camera_->setPropertyExtension(PROPERTY_EXT_AUTO_EXPOSURE_MODE, auto_exp);
+    ERROR_CODE ret = SUCCESS;
+    for (int attempt = 0; attempt < 3; ++attempt)
+    {
+      ret = camera_->setPropertyExtension(PROPERTY_EXT_AUTO_EXPOSURE_MODE, auto_exp);
+      if (ret == SUCCESS)
+      {
+        break;
+      }
+      std::this_thread::sleep_for(200ms);
+    }
     if (ret != SUCCESS)
     {
       RCLCPP_WARN(get_logger(), "Failed to set depth auto exposure mode (ret=%d)", ret);
+    }
+    else
+    {
+      PropertyExtension auto_exp_check;
+      if (camera_->getPropertyExtension(PROPERTY_EXT_AUTO_EXPOSURE_MODE, auto_exp_check) == SUCCESS)
+      {
+        if (auto_exp_check.autoExposureMode != auto_exp.autoExposureMode)
+        {
+          RCLCPP_WARN(get_logger(), "Depth auto exposure mismatch: requested=%d actual=%d",
+            static_cast<int>(auto_exp.autoExposureMode),
+            static_cast<int>(auto_exp_check.autoExposureMode));
+        }
+        else
+        {
+          RCLCPP_INFO(get_logger(), "Depth auto exposure set to %d", static_cast<int>(auto_exp.autoExposureMode));
+        }
+      }
+      else
+      {
+        RCLCPP_WARN(get_logger(), "Failed to read back depth auto exposure mode");
+      }
     }
 
     if (!depth_auto_exposure_)
@@ -313,6 +747,26 @@ private:
         {
           RCLCPP_WARN(get_logger(), "Failed to set depth frame time (ret=%d)", ret);
         }
+        else
+        {
+          float frame_time_check = 0.0f;
+          if (camera_->getProperty(STREAM_TYPE_DEPTH, PROPERTY_FRAMETIME, frame_time_check) == SUCCESS)
+          {
+            if (std::fabs(frame_time_check - static_cast<float>(depth_frame_time_us_)) > 1.0f)
+            {
+              RCLCPP_WARN(get_logger(), "Depth frame time mismatch: requested=%.1f actual=%.1f",
+                depth_frame_time_us_, frame_time_check);
+            }
+            else
+            {
+              RCLCPP_INFO(get_logger(), "Depth frame time set to %.1f", frame_time_check);
+            }
+          }
+          else
+          {
+            RCLCPP_WARN(get_logger(), "Failed to read back depth frame time");
+          }
+        }
       }
 
       if (depth_exposure_us_ > 0.0)
@@ -321,6 +775,26 @@ private:
         if (ret != SUCCESS)
         {
           RCLCPP_WARN(get_logger(), "Failed to set depth exposure (ret=%d)", ret);
+        }
+        else
+        {
+          float exposure_check = 0.0f;
+          if (camera_->getProperty(STREAM_TYPE_DEPTH, PROPERTY_EXPOSURE, exposure_check) == SUCCESS)
+          {
+            if (std::fabs(exposure_check - static_cast<float>(depth_exposure_us_)) > 1.0f)
+            {
+              RCLCPP_WARN(get_logger(), "Depth exposure mismatch: requested=%.1f actual=%.1f",
+                depth_exposure_us_, exposure_check);
+            }
+            else
+            {
+              RCLCPP_INFO(get_logger(), "Depth exposure set to %.1f", exposure_check);
+            }
+          }
+          else
+          {
+            RCLCPP_WARN(get_logger(), "Failed to read back depth exposure");
+          }
         }
       }
     }
@@ -351,6 +825,114 @@ private:
       {
         RCLCPP_WARN(get_logger(), "Failed to set laser luminance (ret=%d)", ret);
       }
+    }
+  }
+
+  void configure_leds()
+  {
+    if (ir_led_enable_ || ir_led_luminance_ > 0)
+    {
+      PropertyExtension ir_led;
+      ir_led.ledCtrlParam.emLedId = LED_ID::IR_LED;
+      ir_led.ledCtrlParam.emCtrlType = ir_led_enable_ ? LED_CTRL_TYPE::ENABLE_LED : LED_CTRL_TYPE::DISABLE_LED;
+
+      ERROR_CODE ret = camera_->setPropertyExtension(PROPERTY_EXT_LED_CTRL, ir_led);
+      if (ret != SUCCESS)
+      {
+        RCLCPP_WARN(get_logger(), "Failed to set IR LED enable (ret=%d)", ret);
+      }
+
+      if (ir_led_luminance_ > 0)
+      {
+        PropertyExtension ir_lum;
+        ir_lum.ledCtrlParam.emLedId = LED_ID::IR_LED;
+        ir_lum.ledCtrlParam.emCtrlType = LED_CTRL_TYPE::LUMINANCE;
+        ir_lum.ledCtrlParam.luminance = static_cast<unsigned int>(ir_led_luminance_);
+        ret = camera_->setPropertyExtension(PROPERTY_EXT_LED_CTRL, ir_lum);
+        if (ret != SUCCESS)
+        {
+          RCLCPP_WARN(get_logger(), "Failed to set IR LED luminance (ret=%d)", ret);
+        }
+      }
+    }
+
+    if (!rgb_led_mode_.empty())
+    {
+      LED_CTRL_TYPE ctrl = LED_CTRL_TYPE::DISABLE_LED;
+      if (rgb_led_mode_ == "enable")
+        ctrl = LED_CTRL_TYPE::ENABLE_LED;
+      else if (rgb_led_mode_ == "often_bright")
+        ctrl = LED_CTRL_TYPE::OFTEN_BRIGHT_LED;
+      else if (rgb_led_mode_ == "twinkle")
+        ctrl = LED_CTRL_TYPE::TWINKLE_LED;
+      else if (rgb_led_mode_ != "disable")
+        RCLCPP_WARN(get_logger(), "Unknown rgb_led_mode '%s'", rgb_led_mode_.c_str());
+
+      PropertyExtension rgb_led;
+      rgb_led.ledCtrlParam.emLedId = LED_ID::RGB_LED;
+      rgb_led.ledCtrlParam.emCtrlType = ctrl;
+
+      ERROR_CODE ret = camera_->setPropertyExtension(PROPERTY_EXT_LED_CTRL, rgb_led);
+      if (ret != SUCCESS)
+      {
+        RCLCPP_WARN(get_logger(), "Failed to set RGB LED mode (ret=%d)", ret);
+      }
+    }
+  }
+
+  void configure_depth_controls()
+  {
+    if (depth_gain_ > 0.0)
+    {
+      ERROR_CODE ret = camera_->setProperty(STREAM_TYPE_DEPTH, PROPERTY_GAIN, static_cast<float>(depth_gain_));
+      if (ret != SUCCESS)
+      {
+        RCLCPP_WARN(get_logger(), "Failed to set depth gain (ret=%d)", ret);
+      }
+    }
+
+    if (trigger_mode_ >= 0)
+    {
+      PropertyExtension trigger;
+      trigger.triggerMode = static_cast<TRIGGER_MODE>(trigger_mode_);
+      ERROR_CODE ret = camera_->setPropertyExtension(PROPERTY_EXT_TRIGGER_MODE, trigger);
+      if (ret != SUCCESS)
+      {
+        RCLCPP_WARN(get_logger(), "Failed to set trigger mode (ret=%d)", ret);
+      }
+    }
+
+    if (depth_range_min_mm_ > 0 || depth_range_max_mm_ > 0)
+    {
+      PropertyExtension range;
+      range.depthRange.min = depth_range_min_mm_;
+      range.depthRange.max = depth_range_max_mm_;
+      ERROR_CODE ret = camera_->setPropertyExtension(PROPERTY_EXT_DEPTH_RANGE, range);
+      if (ret != SUCCESS)
+      {
+        RCLCPP_WARN(get_logger(), "Failed to set depth range (ret=%d)", ret);
+      }
+    }
+
+    if (algorithm_contrast_ > 0)
+    {
+      PropertyExtension contrast;
+      contrast.algorithmContrast = algorithm_contrast_;
+      ERROR_CODE ret = camera_->setPropertyExtension(PROPERTY_EXT_CONTRAST_MIN, contrast);
+      if (ret != SUCCESS)
+      {
+        RCLCPP_WARN(get_logger(), "Failed to set algorithm contrast (ret=%d)", ret);
+      }
+    }
+
+    PropertyExtension match;
+    match.depthRgbMatchParam.iDifThreshold = depth_rgb_match_threshold_;
+    match.depthRgbMatchParam.iRgbOffset = depth_rgb_match_rgb_offset_;
+    match.depthRgbMatchParam.bMakeSureRgbIsAfterDepth = depth_rgb_match_force_rgb_after_depth_;
+    ERROR_CODE ret = camera_->setPropertyExtension(PROPERTY_EXT_DEPTH_RGB_MATCH_PARAM, match);
+    if (ret != SUCCESS)
+    {
+      RCLCPP_WARN(get_logger(), "Failed to set depth/rgb match params (ret=%d)", ret);
     }
   }
 
@@ -429,6 +1011,15 @@ private:
       cam_info.header.frame_id = frame_id;
       cam_info.width = info.width;
       cam_info.height = info.height;
+      if (intr_out)
+      {
+        intr_out->width = static_cast<short>(cam_info.width);
+        intr_out->height = static_cast<short>(cam_info.height);
+        intr_out->fx = static_cast<float>(cam_info.k[0]);
+        intr_out->fy = static_cast<float>(cam_info.k[4]);
+        intr_out->cx = static_cast<float>(cam_info.k[2]);
+        intr_out->cy = static_cast<float>(cam_info.k[5]);
+      }
       return cam_info;
     }
 
@@ -569,7 +1160,11 @@ private:
     sensor_msgs::PointCloud2Modifier modifier(cloud);
     if (has_rgb)
     {
-      modifier.setPointCloud2FieldsByString(2, "xyz", "rgb");
+      modifier.setPointCloud2Fields(4,
+        "x", 1, sensor_msgs::msg::PointField::FLOAT32,
+        "y", 1, sensor_msgs::msg::PointField::FLOAT32,
+        "z", 1, sensor_msgs::msg::PointField::FLOAT32,
+        "rgb", 1, sensor_msgs::msg::PointField::FLOAT32);
     }
     else
     {
@@ -584,21 +1179,39 @@ private:
 
     if (depth_intrinsics_.fx == 0.0f || depth_intrinsics_.fy == 0.0f)
     {
-      RCLCPP_WARN(get_logger(), "Invalid depth intrinsics, skipping pointcloud");
+      Intrinsics intr{};
+      if (camera_ && camera_->getIntrinsics(STREAM_TYPE_DEPTH, intr) == SUCCESS &&
+        intr.fx > 0.0f && intr.fy > 0.0f)
+      {
+        depth_intrinsics_ = intr;
+      }
+    }
+
+    if (depth_intrinsics_.fx == 0.0f || depth_intrinsics_.fy == 0.0f)
+    {
+      if (depth_info_msg_.k[0] > 0.0 && depth_info_msg_.k[4] > 0.0)
+      {
+        depth_intrinsics_.fx = static_cast<float>(depth_info_msg_.k[0]);
+        depth_intrinsics_.fy = static_cast<float>(depth_info_msg_.k[4]);
+        depth_intrinsics_.cx = static_cast<float>(depth_info_msg_.k[2]);
+        depth_intrinsics_.cy = static_cast<float>(depth_info_msg_.k[5]);
+      }
+    }
+
+    if (depth_intrinsics_.fx == 0.0f || depth_intrinsics_.fy == 0.0f)
+    {
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+        "Invalid depth intrinsics, skipping pointcloud");
       return;
     }
 
     sensor_msgs::PointCloud2Iterator<float> iter_x(cloud, "x");
     sensor_msgs::PointCloud2Iterator<float> iter_y(cloud, "y");
     sensor_msgs::PointCloud2Iterator<float> iter_z(cloud, "z");
-    std::unique_ptr<sensor_msgs::PointCloud2Iterator<uint8_t>> iter_r;
-    std::unique_ptr<sensor_msgs::PointCloud2Iterator<uint8_t>> iter_g;
-    std::unique_ptr<sensor_msgs::PointCloud2Iterator<uint8_t>> iter_b;
+    std::unique_ptr<sensor_msgs::PointCloud2Iterator<float>> iter_rgb;
     if (has_rgb)
     {
-      iter_r = std::make_unique<sensor_msgs::PointCloud2Iterator<uint8_t>>(cloud, "r");
-      iter_g = std::make_unique<sensor_msgs::PointCloud2Iterator<uint8_t>>(cloud, "g");
-      iter_b = std::make_unique<sensor_msgs::PointCloud2Iterator<uint8_t>>(cloud, "b");
+      iter_rgb = std::make_unique<sensor_msgs::PointCloud2Iterator<float>>(cloud, "rgb");
     }
 
     const uint16_t * depth = reinterpret_cast<const uint16_t *>(depth_msg.data.data());
@@ -628,12 +1241,13 @@ private:
           const uint8_t r = static_cast<uint8_t>(rgb_data[rgb_idx + 0]);
           const uint8_t g = static_cast<uint8_t>(rgb_data[rgb_idx + 1]);
           const uint8_t b = static_cast<uint8_t>(rgb_data[rgb_idx + 2]);
-          **iter_r = r;
-          **iter_g = g;
-          **iter_b = b;
-          ++(*iter_r);
-          ++(*iter_g);
-          ++(*iter_b);
+          const uint32_t rgb_packed = (static_cast<uint32_t>(r) << 16) |
+                                      (static_cast<uint32_t>(g) << 8) |
+                                      static_cast<uint32_t>(b);
+          float rgb_float;
+          std::memcpy(&rgb_float, &rgb_packed, sizeof(float));
+          **iter_rgb = rgb_float;
+          ++(*iter_rgb);
         }
       }
     }
@@ -642,14 +1256,8 @@ private:
   }
 
   std::string serial_;
-  std::string depth_mode_;
-  std::string rgb_mode_;
-  int depth_width_ = 0;
-  int depth_height_ = 0;
-  double depth_fps_ = 0.0;
-  int rgb_width_ = 0;
-  int rgb_height_ = 0;
-  double rgb_fps_ = 0.0;
+  std::string depth_profile_;
+  std::string rgb_profile_;
 
   std::string depth_frame_id_;
   std::string rgb_frame_id_;
@@ -662,9 +1270,25 @@ private:
   bool depth_auto_exposure_ = false;
   double depth_exposure_us_ = 0.0;
   double depth_frame_time_us_ = 0.0;
+  double depth_gain_ = 0.0;
+  int trigger_mode_ = 0;
+  int depth_rgb_match_threshold_ = 0;
+  int depth_rgb_match_rgb_offset_ = 0;
+  bool depth_rgb_match_force_rgb_after_depth_ = false;
+
+  bool initial_reset_ = false;
+  bool clear_frame_buffer_ = false;
 
   bool laser_enable_ = true;
   int laser_luminance_ = 100;
+
+  bool ir_led_enable_ = false;
+  int ir_led_luminance_ = 0;
+  std::string rgb_led_mode_;
+
+  int depth_range_min_mm_ = 0;
+  int depth_range_max_mm_ = 0;
+  int algorithm_contrast_ = 0;
 
   bool publish_pointcloud_ = false;
 
@@ -690,6 +1314,9 @@ private:
 
   sensor_msgs::msg::CameraInfo depth_info_msg_;
   sensor_msgs::msg::CameraInfo rgb_info_msg_;
+
+  CameraInfo last_camera_info_{};
+  bool has_camera_info_ = false;
 };
 
 }  // namespace revopoint_camera
