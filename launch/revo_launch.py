@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 
 import launch
-from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
-from launch.substitutions import LaunchConfiguration, PathJoinSubstitution, ThisLaunchFileDir
-from launch.launch_description_sources import PythonLaunchDescriptionSource
+from launch.actions import DeclareLaunchArgument
+from launch.substitutions import LaunchConfiguration
 import launch_ros.actions
 
 
@@ -35,21 +34,18 @@ def generate_launch_description():
         "depth_range_max_mm": 2000,
         "algorithm_contrast": 0,
         "publish_pointcloud": True,
+        "publish_depth_viz": False,
     }
 
     namespace = LaunchConfiguration("namespace")
-    tf_prefix = LaunchConfiguration("tf_prefix")
+    publish_depth_viz = LaunchConfiguration("publish_depth_viz")
 
-    tfs = IncludeLaunchDescription(
-        PythonLaunchDescriptionSource(
-            PathJoinSubstitution([ThisLaunchFileDir(), "tfs.launch.py"])
-        ),
-        launch_arguments={"namespace": namespace, "tf_prefix": tf_prefix}.items(),
-    )
+    # Update params with launch configuration
+    params["publish_depth_viz"] = publish_depth_viz
 
     return launch.LaunchDescription([
         DeclareLaunchArgument("namespace", default_value="camera"),
-        DeclareLaunchArgument("tf_prefix", default_value=""),
+        DeclareLaunchArgument("publish_depth_viz", default_value="false"),
         launch_ros.actions.Node(
             package="revopoint_camera",
             executable="revopoint_camera_node",
@@ -58,5 +54,4 @@ def generate_launch_description():
             parameters=[params],
             output="screen",
         ),
-        tfs,
     ])
