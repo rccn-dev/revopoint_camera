@@ -76,11 +76,16 @@ public:
     algorithm_contrast_ = declare_parameter<int>("algorithm_contrast", 0);
 
     publish_pointcloud_ = declare_parameter<bool>("publish_pointcloud", false);
+    publish_depth_viz_ = declare_parameter<bool>("publish_depth_viz", false);
 
     depth_pub_ = create_publisher<sensor_msgs::msg::Image>("depth/image_raw", rclcpp::SensorDataQoS());
     rgb_pub_ = create_publisher<sensor_msgs::msg::Image>("rgb/image_raw", rclcpp::SensorDataQoS());
     depth_info_pub_ = create_publisher<sensor_msgs::msg::CameraInfo>("depth/camera_info", rclcpp::SensorDataQoS());
     rgb_info_pub_ = create_publisher<sensor_msgs::msg::CameraInfo>("rgb/camera_info", rclcpp::SensorDataQoS());
+    if (publish_depth_viz_)
+    {
+      depth_viz_pub_ = create_publisher<sensor_msgs::msg::Image>("depth/image_viz", rclcpp::SensorDataQoS());
+    }
     if (publish_pointcloud_)
     {
       cloud_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>(
@@ -1000,21 +1005,38 @@ private:
   {
     geometry_msgs::msg::TransformStamped tf_msg;
     tf_msg.header.stamp = this->get_clock()->now();
-    tf_msg.header.frame_id = depth_frame_id_;
-    tf_msg.child_frame_id = rgb_frame_id_;
 
-    // SDK extrinsics translation is in millimeters, convert to meters for ROS
-    tf_msg.transform.translation.x = extrinsics.translation[0] * 0.001;
-    tf_msg.transform.translation.y = extrinsics.translation[1] * 0.001;
-    tf_msg.transform.translation.z = extrinsics.translation[2] * 0.001;
+    tf_msg.header.frame_id = rgb_frame_id_;
+    tf_msg.child_frame_id = depth_frame_id_;
 
+    // 1. Load original rotation (Depth -> RGB)
     const float * r = extrinsics.rotation;
     tf2::Matrix3x3 m(
       r[0], r[3], r[6],
       r[1], r[4], r[7],
       r[2], r[5], r[8]);
+
+    // 2. Load original translation (Depth -> RGB) in meters
+    tf2::Vector3 t(
+      extrinsics.translation[0] * 0.001,
+      extrinsics.translation[1] * 0.001,
+      extrinsics.translation[2] * 0.001
+    );
+
+    // 3. Calculate Inverse
+    // Inverse Rotation (Transpose)
+    tf2::Matrix3x3 m_inv = m.transpose();
+    
+    // Inverse Translation: - (R_inv * t)
+    tf2::Vector3 t_inv = -(m_inv * t);
+
+    // 4. Fill the message
+    tf_msg.transform.translation.x = t_inv.x();
+    tf_msg.transform.translation.y = t_inv.y();
+    tf_msg.transform.translation.z = t_inv.z();
+
     tf2::Quaternion q;
-    m.getRotation(q);
+    m_inv.getRotation(q);
     tf_msg.transform.rotation.x = q.x();
     tf_msg.transform.rotation.y = q.y();
     tf_msg.transform.rotation.z = q.z();
@@ -1125,18 +1147,100 @@ private:
     const char * depth_data = frame_dep->getData(FRAME_DATA_FORMAT_Z16);
     if (depth_data)
     {
+      // Copy raw depth data first (for pointcloud generation)
       std::memcpy(depth_msg.data.data(), depth_data, depth_size);
     }
 
     sensor_msgs::msg::CameraInfo depth_info = depth_info_msg_;
     depth_info.header.stamp = stamp;
 
-    depth_pub_->publish(depth_msg);
-    depth_info_pub_->publish(depth_info);
-
+    // Generate pointcloud BEFORE scaling depth image (uses raw SDK units)
     if (publish_pointcloud_ && cloud_pub_)
     {
       publish_pointcloud(depth_msg, frame_rgb);
+    }
+
+    // Now scale depth values for visualization in RVIZ
+    // SDK depth values use depth_scale_sdk_ (e.g., 0.05 mm/unit)
+    // ROS/RVIZ expects depth in millimeters (1.0 mm/unit)
+    if (depth_data && depth_scale_sdk_ != 1.0f)
+    {
+      uint16_t * dst = reinterpret_cast<uint16_t *>(depth_msg.data.data());
+      const float scale_factor = depth_scale_sdk_;
+      
+      for (size_t i = 0; i < depth_msg.width * depth_msg.height; ++i) {
+        if (dst[i] != 0) {
+          float depth_mm = dst[i] * scale_factor;
+          dst[i] = static_cast<uint16_t>(std::min(depth_mm, 65535.0f));
+        }
+      }
+    }
+
+    depth_pub_->publish(depth_msg);
+    depth_info_pub_->publish(depth_info);
+
+    // Publish colorized depth visualization if enabled
+    if (publish_depth_viz_ && depth_viz_pub_)
+    {
+      sensor_msgs::msg::Image depth_viz_msg;
+      depth_viz_msg.header = depth_msg.header;
+      depth_viz_msg.height = depth_msg.height;
+      depth_viz_msg.width = depth_msg.width;
+      depth_viz_msg.encoding = sensor_msgs::image_encodings::RGB8;
+      depth_viz_msg.is_bigendian = false;
+      depth_viz_msg.step = depth_msg.width * 3;
+      depth_viz_msg.data.resize(depth_viz_msg.step * depth_viz_msg.height);
+
+      const uint16_t * depth_ptr = reinterpret_cast<const uint16_t *>(depth_msg.data.data());
+      uint8_t * viz_ptr = depth_viz_msg.data.data();
+
+      // Find min/max for normalization
+      uint16_t min_val = 65535, max_val = 0;
+      for (size_t i = 0; i < depth_msg.width * depth_msg.height; ++i) {
+        if (depth_ptr[i] > 0) {
+          min_val = std::min(min_val, depth_ptr[i]);
+          max_val = std::max(max_val, depth_ptr[i]);
+        }
+      }
+
+      // Colorize using jet colormap
+      for (size_t i = 0; i < depth_msg.width * depth_msg.height; ++i) {
+        uint16_t val = depth_ptr[i];
+        if (val == 0) {
+          viz_ptr[i * 3 + 0] = 0;
+          viz_ptr[i * 3 + 1] = 0;
+          viz_ptr[i * 3 + 2] = 0;
+        } else {
+          float normalized = (max_val > min_val) ? 
+            static_cast<float>(val - min_val) / (max_val - min_val) : 0.0f;
+          
+          // Simple jet colormap
+          float r, g, b;
+          if (normalized < 0.25f) {
+            r = 0.0f;
+            g = normalized * 4.0f;
+            b = 1.0f;
+          } else if (normalized < 0.5f) {
+            r = 0.0f;
+            g = 1.0f;
+            b = 1.0f - (normalized - 0.25f) * 4.0f;
+          } else if (normalized < 0.75f) {
+            r = (normalized - 0.5f) * 4.0f;
+            g = 1.0f;
+            b = 0.0f;
+          } else {
+            r = 1.0f;
+            g = 1.0f - (normalized - 0.75f) * 4.0f;
+            b = 0.0f;
+          }
+          
+          viz_ptr[i * 3 + 0] = static_cast<uint8_t>(r * 255);
+          viz_ptr[i * 3 + 1] = static_cast<uint8_t>(g * 255);
+          viz_ptr[i * 3 + 2] = static_cast<uint8_t>(b * 255);
+        }
+      }
+
+      depth_viz_pub_->publish(depth_viz_msg);
     }
 
     if (!frame_rgb || frame_rgb->empty())
@@ -1196,7 +1300,7 @@ private:
     // Create ROS PointCloud2 message
     sensor_msgs::msg::PointCloud2 cloud;
     cloud.header.stamp = depth_msg.header.stamp;
-    cloud.header.frame_id = rgb_frame_id_;  // Points are in depth camera frame
+    cloud.header.frame_id = depth_frame_id_;
     cloud.height = 1;  // Unordered cloud
     cloud.width = pc.getVertices().size();
     cloud.is_dense = false;
@@ -1299,6 +1403,7 @@ private:
   int algorithm_contrast_ = 0;
 
   bool publish_pointcloud_ = false;
+  bool publish_depth_viz_ = false;
 
   cs::ICameraPtr camera_;
   StreamInfo depth_stream_info_{};
@@ -1314,6 +1419,7 @@ private:
 
   rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr depth_pub_;
   rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr rgb_pub_;
+  rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr depth_viz_pub_;
   rclcpp::Publisher<sensor_msgs::msg::CameraInfo>::SharedPtr depth_info_pub_;
   rclcpp::Publisher<sensor_msgs::msg::CameraInfo>::SharedPtr rgb_info_pub_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr cloud_pub_;
