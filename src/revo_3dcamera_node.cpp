@@ -568,7 +568,7 @@ private:
     {
       for (const auto & info : depth_infos)
       {
-        if (info.format == STREAM_FORMAT_Z16)
+        if (info.format == STREAM_FORMAT_Z16 && info.width == 1600 && info.height == 1200)
         {
           depth_stream_info_ = info;
           RCLCPP_INFO(get_logger(), "Using device default depth stream %dx%d @ %.1f Hz",
@@ -944,11 +944,19 @@ private:
     PropertyExtension scale;
     if (camera_->getPropertyExtension(PROPERTY_EXT_DEPTH_SCALE, scale) == SUCCESS)
     {
-      depth_scale_ = scale.depthScale;
+      // SDK depthScale is in mm per unit (e.g., 0.1 means 0.1mm per depth unit)
+      depth_scale_sdk_ = scale.depthScale;  // Store SDK scale in mm/unit
+      depth_scale_ = scale.depthScale * 0.001f;  // Convert to meters for ROS
+      
+      RCLCPP_INFO(get_logger(), "Depth scale from SDK: %.6f mm/unit -> %.6f m/unit", 
+        depth_scale_sdk_, depth_scale_);
     }
     else
     {
-      depth_scale_ = 1.0f;
+      // Fallback: Common Revopoint value is 0.1mm per unit
+      depth_scale_sdk_ = 0.1f;
+      depth_scale_ = 0.0001f; 
+      RCLCPP_WARN(get_logger(), "Failed to read depth scale from SDK. Using default 0.1 mm/unit");
     }
 
     if (publish_depth_scale_param_)
@@ -957,13 +965,34 @@ private:
     }
 
     Extrinsics extrinsics;
-    if (publish_extrinsics_tf_ && camera_->getExtrinsics(extrinsics) == SUCCESS)
+    if (camera_->getExtrinsics(extrinsics) == SUCCESS)
     {
-      publish_extrinsics_transform(extrinsics);
+      extrinsics_ = extrinsics;
+      has_extrinsics_ = true;
+      
+      RCLCPP_INFO(get_logger(), "Extrinsics: R=[%.3f %.3f %.3f; %.3f %.3f %.3f; %.3f %.3f %.3f] T=[%.6f %.6f %.6f]",
+        extrinsics.rotation[0], extrinsics.rotation[3], extrinsics.rotation[6],
+        extrinsics.rotation[1], extrinsics.rotation[4], extrinsics.rotation[7],
+        extrinsics.rotation[2], extrinsics.rotation[5], extrinsics.rotation[8],
+        extrinsics.translation[0], extrinsics.translation[1], extrinsics.translation[2]);
+      
+      RCLCPP_INFO(get_logger(), "Depth intrinsics: fx=%.2f fy=%.2f cx=%.2f cy=%.2f",
+        depth_intrinsics_.fx, depth_intrinsics_.fy, depth_intrinsics_.cx, depth_intrinsics_.cy);
+      RCLCPP_INFO(get_logger(), "RGB intrinsics: fx=%.2f fy=%.2f cx=%.2f cy=%.2f",
+        rgb_intrinsics_.fx, rgb_intrinsics_.fy, rgb_intrinsics_.cx, rgb_intrinsics_.cy);
+      
+      if (publish_extrinsics_tf_)
+      {
+        publish_extrinsics_transform(extrinsics);
+      }
     }
-    else if (publish_extrinsics_tf_)
+    else
     {
-      RCLCPP_WARN(get_logger(), "Failed to get extrinsics for TF publishing");
+      has_extrinsics_ = false;
+      if (publish_extrinsics_tf_)
+      {
+        RCLCPP_WARN(get_logger(), "Failed to get extrinsics");
+      }
     }
   }
 
@@ -974,9 +1003,10 @@ private:
     tf_msg.header.frame_id = depth_frame_id_;
     tf_msg.child_frame_id = rgb_frame_id_;
 
-    tf_msg.transform.translation.x = extrinsics.translation[0];
-    tf_msg.transform.translation.y = extrinsics.translation[1];
-    tf_msg.transform.translation.z = extrinsics.translation[2];
+    // SDK extrinsics translation is in millimeters, convert to meters for ROS
+    tf_msg.transform.translation.x = extrinsics.translation[0] * 0.001;
+    tf_msg.transform.translation.y = extrinsics.translation[1] * 0.001;
+    tf_msg.transform.translation.z = extrinsics.translation[2] * 0.001;
 
     const float * r = extrinsics.rotation;
     tf2::Matrix3x3 m(
@@ -1141,114 +1171,92 @@ private:
 
   void publish_pointcloud(const sensor_msgs::msg::Image & depth_msg, cs::IFramePtr frame_rgb)
   {
-    if (depth_msg.encoding != sensor_msgs::image_encodings::TYPE_16UC1)
-    {
-      return;
-    }
+    if (depth_msg.encoding != sensor_msgs::image_encodings::TYPE_16UC1) return;
 
-    const bool has_rgb = frame_rgb && !frame_rgb->empty() &&
-      frame_rgb->getWidth() == static_cast<int>(depth_msg.width) &&
-      frame_rgb->getHeight() == static_cast<int>(depth_msg.height);
+    const bool has_rgb_frame = frame_rgb && !frame_rgb->empty();
 
+    // Use SDK's Pointcloud class to generate points with proper color projection
+    cs::Pointcloud pc;
+    const uint16_t * depth_data = reinterpret_cast<const uint16_t *>(depth_msg.data.data());
+    unsigned char * rgb_data = has_rgb_frame ? (unsigned char *)frame_rgb->getData() : nullptr;
+    
+    // Generate points using SDK - it handles all the complex projection internally
+    // SDK expects scale in mm/unit and produces points in mm (verified by PLY output)
+    pc.generatePoints(
+      depth_data,
+      depth_msg.width,
+      depth_msg.height,
+      depth_scale_sdk_,  // mm/unit -> SDK outputs points in mm
+      &depth_intrinsics_,
+      has_rgb_frame ? &rgb_intrinsics_ : nullptr,
+      has_rgb_frame ? &extrinsics_ : nullptr,
+      false  // removeInvalid = false, keep all points
+    );
+
+    // Create ROS PointCloud2 message
     sensor_msgs::msg::PointCloud2 cloud;
     cloud.header.stamp = depth_msg.header.stamp;
-    cloud.header.frame_id = depth_frame_id_;
-    cloud.height = depth_msg.height;
-    cloud.width = depth_msg.width;
+    cloud.header.frame_id = rgb_frame_id_;  // Points are in depth camera frame
+    cloud.height = 1;  // Unordered cloud
+    cloud.width = pc.getVertices().size();
     cloud.is_dense = false;
 
     sensor_msgs::PointCloud2Modifier modifier(cloud);
-    if (has_rgb)
-    {
-      modifier.setPointCloud2Fields(4,
-        "x", 1, sensor_msgs::msg::PointField::FLOAT32,
-        "y", 1, sensor_msgs::msg::PointField::FLOAT32,
-        "z", 1, sensor_msgs::msg::PointField::FLOAT32,
-        "rgb", 1, sensor_msgs::msg::PointField::FLOAT32);
-    }
-    else
-    {
+    if (has_rgb_frame && !pc.getTexcoords().empty()) {
+      modifier.setPointCloud2Fields(4, "x", 1, sensor_msgs::msg::PointField::FLOAT32,
+                                       "y", 1, sensor_msgs::msg::PointField::FLOAT32,
+                                       "z", 1, sensor_msgs::msg::PointField::FLOAT32,
+                                       "rgb", 1, sensor_msgs::msg::PointField::FLOAT32);
+    } else {
       modifier.setPointCloud2FieldsByString(1, "xyz");
     }
-    modifier.resize(cloud.width * cloud.height);
+    modifier.resize(cloud.width);
 
-    const float fx = depth_intrinsics_.fx;
-    const float fy = depth_intrinsics_.fy;
-    const float cx = depth_intrinsics_.cx;
-    const float cy = depth_intrinsics_.cy;
-
-    if (depth_intrinsics_.fx == 0.0f || depth_intrinsics_.fy == 0.0f)
-    {
-      Intrinsics intr{};
-      if (camera_ && camera_->getIntrinsics(STREAM_TYPE_DEPTH, intr) == SUCCESS &&
-        intr.fx > 0.0f && intr.fy > 0.0f)
-      {
-        depth_intrinsics_ = intr;
-      }
-    }
-
-    if (depth_intrinsics_.fx == 0.0f || depth_intrinsics_.fy == 0.0f)
-    {
-      if (depth_info_msg_.k[0] > 0.0 && depth_info_msg_.k[4] > 0.0)
-      {
-        depth_intrinsics_.fx = static_cast<float>(depth_info_msg_.k[0]);
-        depth_intrinsics_.fy = static_cast<float>(depth_info_msg_.k[4]);
-        depth_intrinsics_.cx = static_cast<float>(depth_info_msg_.k[2]);
-        depth_intrinsics_.cy = static_cast<float>(depth_info_msg_.k[5]);
-      }
-    }
-
-    if (depth_intrinsics_.fx == 0.0f || depth_intrinsics_.fy == 0.0f)
-    {
-      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
-        "Invalid depth intrinsics, skipping pointcloud");
-      return;
-    }
-
+    // Copy points from SDK to ROS message
     sensor_msgs::PointCloud2Iterator<float> iter_x(cloud, "x");
     sensor_msgs::PointCloud2Iterator<float> iter_y(cloud, "y");
     sensor_msgs::PointCloud2Iterator<float> iter_z(cloud, "z");
     std::unique_ptr<sensor_msgs::PointCloud2Iterator<float>> iter_rgb;
-    if (has_rgb)
-    {
+    if (has_rgb_frame && !pc.getTexcoords().empty()) {
       iter_rgb = std::make_unique<sensor_msgs::PointCloud2Iterator<float>>(cloud, "rgb");
     }
 
-    const uint16_t * depth = reinterpret_cast<const uint16_t *>(depth_msg.data.data());
-    const char * rgb_data = has_rgb ? frame_rgb->getData() : nullptr;
+    int colored_count = 0;
+    const auto & points = pc.getVertices();
+    const auto & textures = pc.getTexcoords();
+    
+    for (size_t i = 0; i < points.size(); ++i, ++iter_x, ++iter_y, ++iter_z) {
+      const cs::float3 & pt = points[i];
+      // SDK outputs points in millimeters, convert to meters for ROS
+      *iter_x = pt.x * 0.001f;
+      *iter_y = pt.y * 0.001f;
+      *iter_z = pt.z * 0.001f;
 
-    for (unsigned int v = 0; v < depth_msg.height; ++v)
-    {
-      for (unsigned int u = 0; u < depth_msg.width; ++u, ++iter_x, ++iter_y, ++iter_z)
-      {
-        const std::size_t idx = v * depth_msg.width + u;
-        const uint16_t d = depth[idx];
-        if (d == 0)
-        {
-          *iter_x = *iter_y = *iter_z = std::numeric_limits<float>::quiet_NaN();
-        }
-        else
-        {
-          const float z = static_cast<float>(d) * depth_scale_;
-          *iter_x = (static_cast<float>(u) - cx) * z / fx;
-          *iter_y = (static_cast<float>(v) - cy) * z / fy;
-          *iter_z = z;
-        }
+      if (iter_rgb && i < textures.size()) {
+        const cs::float2 & tex = textures[i];
+        // Texture coords are normalized [0,1], convert to pixel coords
+        int tex_x = static_cast<int>(tex.u * (frame_rgb->getWidth() - 1));
+        int tex_y = static_cast<int>(tex.v * (frame_rgb->getHeight() - 1));
 
-        if (has_rgb)
-        {
-          const std::size_t rgb_idx = idx * 3;
-          const uint8_t r = static_cast<uint8_t>(rgb_data[rgb_idx + 0]);
-          const uint8_t g = static_cast<uint8_t>(rgb_data[rgb_idx + 1]);
-          const uint8_t b = static_cast<uint8_t>(rgb_data[rgb_idx + 2]);
-          const uint32_t rgb_packed = (static_cast<uint32_t>(r) << 16) |
-                                      (static_cast<uint32_t>(g) << 8) |
-                                      static_cast<uint32_t>(b);
+        if (tex_x >= 0 && tex_x < frame_rgb->getWidth() &&
+            tex_y >= 0 && tex_y < frame_rgb->getHeight()) {
+          const size_t idx = (tex_y * frame_rgb->getWidth() + tex_x) * 3;
+          uint8_t r = static_cast<uint8_t>(rgb_data[idx + 0]);
+          uint8_t g = static_cast<uint8_t>(rgb_data[idx + 1]);
+          uint8_t b = static_cast<uint8_t>(rgb_data[idx + 2]);
+
+          // Pack RGB into float
+          uint32_t rgb_packed = (static_cast<uint32_t>(r) << 16) |
+                                (static_cast<uint32_t>(g) << 8) |
+                                static_cast<uint32_t>(b);
           float rgb_float;
           std::memcpy(&rgb_float, &rgb_packed, sizeof(float));
           **iter_rgb = rgb_float;
-          ++(*iter_rgb);
+          ++colored_count;
+        } else {
+          **iter_rgb = std::numeric_limits<float>::quiet_NaN();
         }
+        ++(*iter_rgb);
       }
     }
 
@@ -1296,7 +1304,8 @@ private:
   StreamInfo depth_stream_info_{};
   StreamInfo rgb_stream_info_{};
 
-  float depth_scale_ = 1.0f;
+  float depth_scale_ = 1.0f;  // Depth scale in meters/unit (for ROS)
+  float depth_scale_sdk_ = 0.1f;  // Depth scale in mm/unit (for SDK generatePoints)
 
   Intrinsics depth_intrinsics_{};
   Intrinsics rgb_intrinsics_{};
@@ -1314,6 +1323,9 @@ private:
 
   sensor_msgs::msg::CameraInfo depth_info_msg_;
   sensor_msgs::msg::CameraInfo rgb_info_msg_;
+
+  Extrinsics extrinsics_{};
+  bool has_extrinsics_ = false;
 
   CameraInfo last_camera_info_{};
   bool has_camera_info_ = false;
