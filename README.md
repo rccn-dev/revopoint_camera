@@ -153,6 +153,10 @@ colcon build --packages-select revopoint_camera
 source install/setup.bash
 ```
 
+## CI/CD
+
+This repository includes GitHub Actions CI workflow for automated building and testing. See [.github/CI_SETUP.md](.github/CI_SETUP.md) for details on the CI configuration.
+
 ## License
 
 See package.xml for license information.
