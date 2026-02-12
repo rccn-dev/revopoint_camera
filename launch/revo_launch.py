@@ -36,6 +36,8 @@ def generate_launch_description():
         "publish_pointcloud": True,
         "publish_depth_viz": False,
         "qos_profile": "reliable",
+        "enable_watchdog": True,
+        "frame_timeout_seconds": 5.0,
     }
 
     namespace = LaunchConfiguration("namespace")
