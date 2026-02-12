@@ -1241,7 +1241,7 @@ private:
 
   void handle_frame_pair(cs::IFramePtr frame_dep, cs::IFramePtr frame_rgb)
   {
-    // Update frame timestamp for watchdog (store as nanoseconds since steady_clock start)
+    // Update frame timestamp for watchdog (nanoseconds from steady_clock epoch, unspecified)
     auto now = std::chrono::steady_clock::now();
     int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
       now.time_since_epoch()).count();
@@ -1576,7 +1576,7 @@ private:
 
   // Stream health monitoring
   rclcpp::TimerBase::SharedPtr watchdog_timer_;
-  std::atomic<int64_t> last_frame_time_ns_{0};  // Nanoseconds since steady_clock start (unspecified epoch)
+  std::atomic<int64_t> last_frame_time_ns_{0};  // Nanoseconds from steady_clock epoch (unspecified)
   std::atomic<uint64_t> frame_count_{0};
   std::atomic<uint64_t> error_count_{0};
   double frame_timeout_seconds_ = 5.0;
