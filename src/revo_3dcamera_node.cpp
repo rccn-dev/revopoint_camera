@@ -136,7 +136,7 @@ private:
     }
     else
     {
-      RCLCPP_WARN(get_logger(), 
+      RCLCPP_WARN_ONCE(get_logger(), 
         "Unknown QoS profile '%s', defaulting to 'reliable'. "
         "Valid options are: 'reliable', 'best_effort', 'sensor_data'", 
         qos_profile_.c_str());
