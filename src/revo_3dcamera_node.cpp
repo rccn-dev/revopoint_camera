@@ -77,7 +77,6 @@ public:
 
     publish_pointcloud_ = declare_parameter<bool>("publish_pointcloud", false);
     publish_depth_viz_ = declare_parameter<bool>("publish_depth_viz", false);
-
     qos_profile_ = declare_parameter<std::string>("qos_profile", "reliable");
 
     depth_pub_ = create_publisher<sensor_msgs::msg::Image>("depth/image_raw", get_qos());
@@ -110,6 +109,18 @@ public:
   }
 
 private:
+  /**
+   * @brief Get the configured QoS profile for publishers.
+   * 
+   * Reads the qos_profile_ member variable and returns the appropriate ROS2 QoS.
+   * 
+   * Supported QoS profiles:
+   * - "reliable": Reliable delivery with history depth of 10 (default)
+   * - "best_effort": Best-effort delivery (SensorDataQoS)
+   * - "sensor_data": Alias for best_effort (SensorDataQoS)
+   * 
+   * @return rclcpp::QoS The configured QoS profile, defaults to reliable if unknown
+   */
   rclcpp::QoS get_qos() const
   {
     // Parse QoS profile string and return appropriate QoS
@@ -125,7 +136,10 @@ private:
     }
     else
     {
-      RCLCPP_WARN(get_logger(), "Unknown QoS profile '%s', defaulting to 'reliable'", qos_profile_.c_str());
+      RCLCPP_WARN(get_logger(), 
+        "Unknown QoS profile '%s', defaulting to 'reliable'. "
+        "Valid options are: 'reliable', 'best_effort', 'sensor_data'", 
+        qos_profile_.c_str());
       return rclcpp::QoS(rclcpp::KeepLast(10)).reliable();
     }
   }
