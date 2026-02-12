@@ -1067,7 +1067,9 @@ private:
       return;
     }
     
-    auto last_frame_time = std::chrono::steady_clock::time_point(std::chrono::nanoseconds(last_frame_time_ns));
+    // Reconstruct time_point from stored nanoseconds
+    auto last_frame_time = std::chrono::steady_clock::time_point(
+      std::chrono::steady_clock::duration(last_frame_time_ns));
     auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - last_frame_time).count();
     
     if (elapsed > frame_timeout_seconds_)
@@ -1229,9 +1231,9 @@ private:
 
   void handle_frame_pair(cs::IFramePtr frame_dep, cs::IFramePtr frame_rgb)
   {
-    // Update frame timestamp for watchdog (store as nanoseconds since epoch)
+    // Update frame timestamp for watchdog (store as nanoseconds from steady_clock epoch)
     auto now = std::chrono::steady_clock::now();
-    int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count();
+    int64_t now_ns = now.time_since_epoch().count();
     last_frame_time_ns_.store(now_ns);
     frame_count_.fetch_add(1);
     
@@ -1561,7 +1563,7 @@ private:
 
   // Stream health monitoring
   rclcpp::TimerBase::SharedPtr watchdog_timer_;
-  std::atomic<int64_t> last_frame_time_ns_{0};  // Nanoseconds since epoch
+  std::atomic<int64_t> last_frame_time_ns_{0};  // Nanoseconds from steady_clock epoch
   std::atomic<uint64_t> frame_count_{0};
   std::atomic<uint64_t> error_count_{0};
   double frame_timeout_seconds_ = 5.0;
