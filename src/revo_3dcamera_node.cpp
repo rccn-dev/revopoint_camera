@@ -1059,14 +1059,15 @@ private:
   void check_stream_health()
   {
     auto now = std::chrono::steady_clock::now();
-    auto last_frame_time = last_frame_time_.load();
+    int64_t last_frame_time_ns = last_frame_time_ns_.load();
     
     // Skip check if we haven't received any frames yet (during startup)
-    if (last_frame_time == std::chrono::steady_clock::time_point{})
+    if (last_frame_time_ns == 0)
     {
       return;
     }
     
+    auto last_frame_time = std::chrono::steady_clock::time_point(std::chrono::nanoseconds(last_frame_time_ns));
     auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - last_frame_time).count();
     
     if (elapsed > frame_timeout_seconds_)
@@ -1216,26 +1217,28 @@ private:
       catch (const std::exception & e)
       {
         RCLCPP_ERROR(self->get_logger(), "Exception in frame callback: %s", e.what());
-        self->error_count_++;
+        self->error_count_.fetch_add(1);
       }
       catch (...)
       {
         RCLCPP_ERROR(self->get_logger(), "Unknown exception in frame callback");
-        self->error_count_++;
+        self->error_count_.fetch_add(1);
       }
     }
   }
 
   void handle_frame_pair(cs::IFramePtr frame_dep, cs::IFramePtr frame_rgb)
   {
-    // Update frame timestamp for watchdog
-    last_frame_time_.store(std::chrono::steady_clock::now());
-    frame_count_++;
+    // Update frame timestamp for watchdog (store as nanoseconds since epoch)
+    auto now = std::chrono::steady_clock::now();
+    int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count();
+    last_frame_time_ns_.store(now_ns);
+    frame_count_.fetch_add(1);
     
     if (!frame_dep || frame_dep->empty())
     {
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000, "Received empty depth frame");
-      error_count_++;
+      error_count_.fetch_add(1);
       return;
     }
 
@@ -1257,7 +1260,7 @@ private:
     if (!depth_data)
     {
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000, "Failed to get depth data from frame");
-      error_count_++;
+      error_count_.fetch_add(1);
       return;
     }
     
@@ -1378,7 +1381,7 @@ private:
     if (!rgb_data)
     {
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000, "Failed to get RGB data from frame");
-      error_count_++;
+      error_count_.fetch_add(1);
       return;
     }
     
@@ -1558,7 +1561,7 @@ private:
 
   // Stream health monitoring
   rclcpp::TimerBase::SharedPtr watchdog_timer_;
-  std::atomic<std::chrono::steady_clock::time_point> last_frame_time_{std::chrono::steady_clock::time_point{}};
+  std::atomic<int64_t> last_frame_time_ns_{0};  // Nanoseconds since epoch
   std::atomic<uint64_t> frame_count_{0};
   std::atomic<uint64_t> error_count_{0};
   double frame_timeout_seconds_ = 5.0;
