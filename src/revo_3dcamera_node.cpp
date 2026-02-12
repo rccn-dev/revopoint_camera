@@ -1085,7 +1085,7 @@ private:
         "Frame statistics - Total: %lu, Errors: %lu, Last frame: %ld seconds ago",
         total_frames, error_count, elapsed);
     }
-    else if (elapsed > frame_timeout_seconds_ / 2)
+    else if (static_cast<double>(elapsed) > frame_timeout_seconds_ / 2.0)
     {
       // Warning when we're halfway to timeout
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,

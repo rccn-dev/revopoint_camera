@@ -142,7 +142,7 @@ If you see frequent warnings about empty frames or data errors:
 
 The watchdog timer runs at 1 Hz and has minimal performance impact:
 - CPU: <0.1% overhead
-- Memory: <1KB additional
+- Memory: ~24 bytes for atomic variables plus minimal timer overhead
 - No impact on frame callback performance
 
 ## Building
