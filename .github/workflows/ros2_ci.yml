@@ -38,6 +38,7 @@ jobs:
       
       - name: Initialize rosdep
         run: |
+          # Initialize rosdep (may already be initialized in container, hence || true)
           sudo rosdep init || true
       
       - name: Update rosdep
