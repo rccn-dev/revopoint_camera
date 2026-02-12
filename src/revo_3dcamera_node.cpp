@@ -102,6 +102,16 @@ public:
     frame_timeout_seconds_ = declare_parameter<double>("frame_timeout_seconds", 5.0);
     enable_watchdog_ = declare_parameter<bool>("enable_watchdog", true);
     
+    // Validate timeout value
+    if (frame_timeout_seconds_ <= 0.0)
+    {
+      RCLCPP_WARN(get_logger(), "Invalid frame_timeout_seconds %.1f, using default 5.0", frame_timeout_seconds_);
+      frame_timeout_seconds_ = 5.0;
+    }
+    
+    // Pre-compute half timeout threshold to avoid repeated division
+    half_timeout_seconds_ = frame_timeout_seconds_ / 2.0;
+    
     if (!start_camera())
     {
       RCLCPP_ERROR(get_logger(), "Failed to start camera");
@@ -1085,7 +1095,7 @@ private:
         "Frame statistics - Total: %lu, Errors: %lu, Last frame: %ld seconds ago",
         total_frames, error_count, elapsed);
     }
-    else if (static_cast<double>(elapsed) > frame_timeout_seconds_ / 2.0)
+    else if (static_cast<double>(elapsed) > half_timeout_seconds_)
     {
       // Warning when we're halfway to timeout
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
@@ -1233,7 +1243,8 @@ private:
   {
     // Update frame timestamp for watchdog (store as nanoseconds from steady_clock epoch)
     auto now = std::chrono::steady_clock::now();
-    int64_t now_ns = now.time_since_epoch().count();
+    int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+      now.time_since_epoch()).count();
     last_frame_time_ns_.store(now_ns);
     frame_count_.fetch_add(1);
     
@@ -1363,7 +1374,9 @@ private:
 
     if (!frame_rgb || frame_rgb->empty())
     {
-      // RGB frame is optional, just skip without error
+      // RGB frame is optional in some camera modes. When using depth-only mode or when
+      // RGB camera is not configured, we don't treat this as an error. The depth data
+      // is still valid and can be published independently.
       return;
     }
 
@@ -1567,6 +1580,7 @@ private:
   std::atomic<uint64_t> frame_count_{0};
   std::atomic<uint64_t> error_count_{0};
   double frame_timeout_seconds_ = 5.0;
+  double half_timeout_seconds_ = 2.5;  // Pre-computed for efficiency
   bool enable_watchdog_ = true;
 };
 
