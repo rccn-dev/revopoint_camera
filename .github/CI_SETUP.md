@@ -29,7 +29,7 @@ rosdep update
 PIP_BREAK_SYSTEM_PACKAGES=1 rosdep install -r --from-paths src/ --ignore-src -y
 ```
 
-This is the method used in the GitHub Actions workflow (see line 48-51 in `.github/workflows/ros2_ci.yml`).
+This is the method used in the GitHub Actions workflow (see lines 51-55 in `.github/workflows/ros2_ci.yml`).
 
 ### Why PIP_BREAK_SYSTEM_PACKAGES is needed
 
