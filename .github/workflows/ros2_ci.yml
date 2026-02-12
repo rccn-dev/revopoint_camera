@@ -48,7 +48,7 @@ jobs:
         env:
           PIP_BREAK_SYSTEM_PACKAGES: 1
         run: |
-          rosdep install -r ${{ matrix.ros_distribution }} --from-paths src/ --ignore-src -y
+          rosdep install -r --from-paths src/ --ignore-src -y
       
       - name: Build workspace
         shell: bash

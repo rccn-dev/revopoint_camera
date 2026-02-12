@@ -26,7 +26,7 @@ The most straightforward approach is to set the environment variable in the shel
 ```bash
 sudo rosdep init
 rosdep update
-PIP_BREAK_SYSTEM_PACKAGES=1 rosdep install -r rolling --from-paths src/ --ignore-src -y
+PIP_BREAK_SYSTEM_PACKAGES=1 rosdep install -r --from-paths src/ --ignore-src -y
 ```
 
 This is the method used in the GitHub Actions workflow (see line 48-51 in `.github/workflows/ros2_ci.yml`).
@@ -56,7 +56,7 @@ git clone https://github.com/rccn-dev/revopoint_camera.git
 cd ~/ros2_ws
 sudo rosdep init  # Only needed once on your system
 rosdep update
-PIP_BREAK_SYSTEM_PACKAGES=1 rosdep install -r rolling --from-paths src/ --ignore-src -y
+PIP_BREAK_SYSTEM_PACKAGES=1 rosdep install -r --from-paths src/ --ignore-src -y
 
 # Build
 source /opt/ros/rolling/setup.bash
