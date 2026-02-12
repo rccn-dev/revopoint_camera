@@ -35,17 +35,21 @@ def generate_launch_description():
         "algorithm_contrast": 0,
         "publish_pointcloud": True,
         "publish_depth_viz": False,
+        "qos_profile": "reliable",
     }
 
     namespace = LaunchConfiguration("namespace")
     publish_depth_viz = LaunchConfiguration("publish_depth_viz")
+    qos_profile = LaunchConfiguration("qos_profile")
 
     # Update params with launch configuration
     params["publish_depth_viz"] = publish_depth_viz
+    params["qos_profile"] = qos_profile
 
     return launch.LaunchDescription([
         DeclareLaunchArgument("namespace", default_value="camera"),
         DeclareLaunchArgument("publish_depth_viz", default_value="false"),
+        DeclareLaunchArgument("qos_profile", default_value="reliable"),
         launch_ros.actions.Node(
             package="revopoint_camera",
             executable="revopoint_camera_node",

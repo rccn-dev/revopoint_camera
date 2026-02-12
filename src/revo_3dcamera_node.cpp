@@ -77,19 +77,19 @@ public:
 
     publish_pointcloud_ = declare_parameter<bool>("publish_pointcloud", false);
     publish_depth_viz_ = declare_parameter<bool>("publish_depth_viz", false);
+    qos_profile_ = declare_parameter<std::string>("qos_profile", "reliable");
 
-    depth_pub_ = create_publisher<sensor_msgs::msg::Image>("depth/image_raw", rclcpp::SensorDataQoS());
-    rgb_pub_ = create_publisher<sensor_msgs::msg::Image>("rgb/image_raw", rclcpp::SensorDataQoS());
-    depth_info_pub_ = create_publisher<sensor_msgs::msg::CameraInfo>("depth/camera_info", rclcpp::SensorDataQoS());
-    rgb_info_pub_ = create_publisher<sensor_msgs::msg::CameraInfo>("rgb/camera_info", rclcpp::SensorDataQoS());
+    depth_pub_ = create_publisher<sensor_msgs::msg::Image>("depth/image_raw", get_qos());
+    rgb_pub_ = create_publisher<sensor_msgs::msg::Image>("rgb/image_raw", get_qos());
+    depth_info_pub_ = create_publisher<sensor_msgs::msg::CameraInfo>("depth/camera_info", get_qos());
+    rgb_info_pub_ = create_publisher<sensor_msgs::msg::CameraInfo>("rgb/camera_info", get_qos());
     if (publish_depth_viz_)
     {
-      depth_viz_pub_ = create_publisher<sensor_msgs::msg::Image>("depth/image_viz", rclcpp::SensorDataQoS());
+      depth_viz_pub_ = create_publisher<sensor_msgs::msg::Image>("depth/image_viz", get_qos());
     }
     if (publish_pointcloud_)
     {
-      cloud_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>(
-        "points", rclcpp::QoS(rclcpp::KeepLast(10)).reliable());
+      cloud_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>("points", get_qos());
     }
 
     depth_info_manager_ = std::make_shared<camera_info_manager::CameraInfoManager>(this, "depth", depth_info_url_);
@@ -109,6 +109,41 @@ public:
   }
 
 private:
+  /**
+   * @brief Get the configured QoS profile for publishers.
+   * 
+   * Reads the qos_profile_ member variable and returns the appropriate ROS2 QoS.
+   * 
+   * Supported QoS profiles:
+   * - "reliable": Reliable delivery with history depth of 10 (default)
+   * - "best_effort": Best-effort delivery (SensorDataQoS)
+   * - "sensor_data": Alias for best_effort (SensorDataQoS)
+   * 
+   * @return rclcpp::QoS The configured QoS profile, defaults to reliable if unknown
+   */
+  rclcpp::QoS get_qos() const
+  {
+    // Parse QoS profile string and return appropriate QoS
+    if (qos_profile_ == "reliable")
+    {
+      // Reliable QoS with history depth of 10
+      return rclcpp::QoS(rclcpp::KeepLast(10)).reliable();
+    }
+    else if (qos_profile_ == "best_effort" || qos_profile_ == "sensor_data")
+    {
+      // Best effort QoS (SensorDataQoS)
+      return rclcpp::SensorDataQoS();
+    }
+    else
+    {
+      RCLCPP_WARN_ONCE(get_logger(), 
+        "Unknown QoS profile '%s', defaulting to 'reliable'. "
+        "Valid options are: 'reliable', 'best_effort', 'sensor_data'", 
+        qos_profile_.c_str());
+      return rclcpp::QoS(rclcpp::KeepLast(10)).reliable();
+    }
+  }
+
   bool hardware_reset(const CameraInfo * info)
   {
     CSystem * sys = createSystem();
@@ -1404,6 +1439,8 @@ private:
 
   bool publish_pointcloud_ = false;
   bool publish_depth_viz_ = false;
+
+  std::string qos_profile_;
 
   cs::ICameraPtr camera_;
   StreamInfo depth_stream_info_{};
