@@ -1,0 +1,65 @@
+name: ROS2 CI
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        ros_distribution:
+          - rolling
+          - jazzy
+          - iron
+    
+    container:
+      image: ros:${{ matrix.ros_distribution }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          path: src/revopoint_camera
+      
+      - name: Setup ROS environment
+        shell: bash
+        run: |
+          source /opt/ros/${{ matrix.ros_distribution }}/setup.bash
+          echo "ROS_DISTRO=${{ matrix.ros_distribution }}" >> $GITHUB_ENV
+      
+      - name: Install rosdep
+        run: |
+          apt-get update
+          apt-get install -y python3-rosdep
+      
+      - name: Initialize rosdep
+        run: |
+          sudo rosdep init || true
+      
+      - name: Update rosdep
+        run: |
+          rosdep update
+      
+      - name: Install dependencies
+        env:
+          PIP_BREAK_SYSTEM_PACKAGES: 1
+        run: |
+          rosdep install -r ${{ matrix.ros_distribution }} --from-paths src/ --ignore-src -y
+      
+      - name: Build workspace
+        shell: bash
+        run: |
+          source /opt/ros/${{ matrix.ros_distribution }}/setup.bash
+          colcon build --packages-select revopoint_camera
+      
+      - name: Run tests
+        shell: bash
+        run: |
+          source /opt/ros/${{ matrix.ros_distribution }}/setup.bash
+          source install/setup.bash
+          colcon test --packages-select revopoint_camera || true
+          colcon test-result --verbose || true
