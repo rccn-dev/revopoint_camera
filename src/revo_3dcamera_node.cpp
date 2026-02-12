@@ -110,7 +110,7 @@ public:
   }
 
 private:
-  rclcpp::QoS get_qos()
+  rclcpp::QoS get_qos() const
   {
     // Parse QoS profile string and return appropriate QoS
     if (qos_profile_ == "reliable")
@@ -118,14 +118,9 @@ private:
       // Reliable QoS with history depth of 10
       return rclcpp::QoS(rclcpp::KeepLast(10)).reliable();
     }
-    else if (qos_profile_ == "best_effort")
+    else if (qos_profile_ == "best_effort" || qos_profile_ == "sensor_data")
     {
       // Best effort QoS (SensorDataQoS)
-      return rclcpp::SensorDataQoS();
-    }
-    else if (qos_profile_ == "sensor_data")
-    {
-      // Alias for best_effort
       return rclcpp::SensorDataQoS();
     }
     else
