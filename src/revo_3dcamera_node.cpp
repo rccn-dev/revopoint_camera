@@ -7,6 +7,7 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <exception>
 
 #include "rclcpp/rclcpp.hpp"
 #include "geometry_msgs/msg/transform_stamped.hpp"
@@ -97,14 +98,33 @@ public:
 
     tf_broadcaster_ = std::make_shared<tf2_ros::StaticTransformBroadcaster>(this);
 
+    // Initialize frame monitoring
+    frame_timeout_seconds_ = declare_parameter<double>("frame_timeout_seconds", 5.0);
+    enable_watchdog_ = declare_parameter<bool>("enable_watchdog", true);
+    
     if (!start_camera())
     {
       RCLCPP_ERROR(get_logger(), "Failed to start camera");
+    }
+    
+    // Start watchdog timer if enabled
+    if (enable_watchdog_)
+    {
+      watchdog_timer_ = create_wall_timer(
+        std::chrono::milliseconds(1000),
+        [this]() { this->check_stream_health(); });
+      RCLCPP_INFO(get_logger(), "Stream watchdog enabled with %.1f second timeout", frame_timeout_seconds_);
     }
   }
 
   ~RevopointCameraNode() override
   {
+    // Disable watchdog before shutdown
+    if (watchdog_timer_)
+    {
+      watchdog_timer_->cancel();
+      watchdog_timer_.reset();
+    }
     stop_camera();
   }
 
@@ -1036,6 +1056,41 @@ private:
     }
   }
 
+  void check_stream_health()
+  {
+    auto now = std::chrono::steady_clock::now();
+    auto last_frame_time = last_frame_time_.load();
+    
+    // Skip check if we haven't received any frames yet (during startup)
+    if (last_frame_time == std::chrono::steady_clock::time_point{})
+    {
+      return;
+    }
+    
+    auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - last_frame_time).count();
+    
+    if (elapsed > frame_timeout_seconds_)
+    {
+      RCLCPP_ERROR(get_logger(), 
+        "Stream timeout! No frames received for %ld seconds. Camera may have failed.", 
+        elapsed);
+      
+      // Log frame statistics
+      auto total_frames = frame_count_.load();
+      auto error_count = error_count_.load();
+      RCLCPP_ERROR(get_logger(), 
+        "Frame statistics - Total: %lu, Errors: %lu, Last frame: %ld seconds ago",
+        total_frames, error_count, elapsed);
+    }
+    else if (elapsed > frame_timeout_seconds_ / 2)
+    {
+      // Warning when we're halfway to timeout
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+        "Stream degraded: No frames for %ld seconds (timeout threshold: %.1f seconds)",
+        elapsed, frame_timeout_seconds_);
+    }
+  }
+
   void publish_extrinsics_transform(const Extrinsics & extrinsics)
   {
     geometry_msgs::msg::TransformStamped tf_msg;
@@ -1154,14 +1209,33 @@ private:
     auto * self = static_cast<RevopointCameraNode *>(user_data);
     if (self)
     {
-      self->handle_frame_pair(frame_dep, frame_rgb);
+      try
+      {
+        self->handle_frame_pair(frame_dep, frame_rgb);
+      }
+      catch (const std::exception & e)
+      {
+        RCLCPP_ERROR(self->get_logger(), "Exception in frame callback: %s", e.what());
+        self->error_count_++;
+      }
+      catch (...)
+      {
+        RCLCPP_ERROR(self->get_logger(), "Unknown exception in frame callback");
+        self->error_count_++;
+      }
     }
   }
 
   void handle_frame_pair(cs::IFramePtr frame_dep, cs::IFramePtr frame_rgb)
   {
+    // Update frame timestamp for watchdog
+    last_frame_time_.store(std::chrono::steady_clock::now());
+    frame_count_++;
+    
     if (!frame_dep || frame_dep->empty())
     {
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000, "Received empty depth frame");
+      error_count_++;
       return;
     }
 
@@ -1180,11 +1254,15 @@ private:
     depth_msg.data.resize(depth_size);
 
     const char * depth_data = frame_dep->getData(FRAME_DATA_FORMAT_Z16);
-    if (depth_data)
+    if (!depth_data)
     {
-      // Copy raw depth data first (for pointcloud generation)
-      std::memcpy(depth_msg.data.data(), depth_data, depth_size);
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000, "Failed to get depth data from frame");
+      error_count_++;
+      return;
     }
+    
+    // Copy raw depth data first (for pointcloud generation)
+    std::memcpy(depth_msg.data.data(), depth_data, depth_size);
 
     sensor_msgs::msg::CameraInfo depth_info = depth_info_msg_;
     depth_info.header.stamp = stamp;
@@ -1198,7 +1276,7 @@ private:
     // Now scale depth values for visualization in RVIZ
     // SDK depth values use depth_scale_sdk_ (e.g., 0.05 mm/unit)
     // ROS/RVIZ expects depth in millimeters (1.0 mm/unit)
-    if (depth_data && depth_scale_sdk_ != 1.0f)
+    if (depth_scale_sdk_ != 1.0f)
     {
       uint16_t * dst = reinterpret_cast<uint16_t *>(depth_msg.data.data());
       const float scale_factor = depth_scale_sdk_;
@@ -1280,6 +1358,7 @@ private:
 
     if (!frame_rgb || frame_rgb->empty())
     {
+      // RGB frame is optional, just skip without error
       return;
     }
 
@@ -1296,10 +1375,14 @@ private:
     rgb_msg.data.resize(rgb_size);
 
     const char * rgb_data = frame_rgb->getData();
-    if (rgb_data)
+    if (!rgb_data)
     {
-      std::memcpy(rgb_msg.data.data(), rgb_data, rgb_size);
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000, "Failed to get RGB data from frame");
+      error_count_++;
+      return;
     }
+    
+    std::memcpy(rgb_msg.data.data(), rgb_data, rgb_size);
 
     sensor_msgs::msg::CameraInfo rgb_info = rgb_info_msg_;
     rgb_info.header.stamp = stamp;
@@ -1472,6 +1555,14 @@ private:
 
   CameraInfo last_camera_info_{};
   bool has_camera_info_ = false;
+
+  // Stream health monitoring
+  rclcpp::TimerBase::SharedPtr watchdog_timer_;
+  std::atomic<std::chrono::steady_clock::time_point> last_frame_time_{std::chrono::steady_clock::time_point{}};
+  std::atomic<uint64_t> frame_count_{0};
+  std::atomic<uint64_t> error_count_{0};
+  double frame_timeout_seconds_ = 5.0;
+  bool enable_watchdog_ = true;
 };
 
 }  // namespace revopoint_camera
