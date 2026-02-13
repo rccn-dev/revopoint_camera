@@ -1488,10 +1488,10 @@ private:
             tex_y >= 0 && tex_y < rgb_height) {
           const size_t idx = (tex_y * rgb_width + tex_x) * 3;
           
-          // Pack RGB into float
-          const uint32_t rgb_packed = (static_cast<uint32_t>(rgb_data[idx + 0]) << 16) |
-                                      (static_cast<uint32_t>(rgb_data[idx + 1]) << 8) |
-                                      static_cast<uint32_t>(rgb_data[idx + 2]);
+          // Pack RGB into float (RGB order: R=idx+0, G=idx+1, B=idx+2)
+          const uint32_t rgb_packed = (static_cast<uint32_t>(rgb_data[idx + 0]) << 16) |  // R
+                                      (static_cast<uint32_t>(rgb_data[idx + 1]) << 8) |   // G
+                                      static_cast<uint32_t>(rgb_data[idx + 2]);           // B
           float rgb_float;
           std::memcpy(&rgb_float, &rgb_packed, sizeof(float));
           **iter_rgb = rgb_float;
