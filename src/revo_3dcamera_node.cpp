@@ -549,16 +549,21 @@ private:
       label.c_str(), static_cast<int>(info.format), info.width, info.height, info.fps);
   }
 
+  void initialize_rgb_parameters()
+  {
+    // Pre-compute RGB frame dimensions and texture scale factors once at stream start
+    rgb_width_ = rgb_stream_info_.width;
+    rgb_height_ = rgb_stream_info_.height;
+    tex_scale_x_ = static_cast<float>(rgb_width_ - 1);
+    tex_scale_y_ = static_cast<float>(rgb_height_ - 1);
+  }
+
   bool start_streams()
   {
     ERROR_CODE ret = camera_->startStream(depth_stream_info_, rgb_stream_info_, &RevopointCameraNode::frame_pair_callback, this);
     if (ret == SUCCESS)
     {
-      // Pre-compute RGB frame dimensions and texture scale factors once at stream start
-      rgb_width_ = rgb_stream_info_.width;
-      rgb_height_ = rgb_stream_info_.height;
-      tex_scale_x_ = static_cast<float>(rgb_width_ - 1);
-      tex_scale_y_ = static_cast<float>(rgb_height_ - 1);
+      initialize_rgb_parameters();
       return true;
     }
 
@@ -579,11 +584,7 @@ private:
       return false;
     }
 
-    // Pre-compute RGB frame dimensions and texture scale factors once at stream start
-    rgb_width_ = rgb_stream_info_.width;
-    rgb_height_ = rgb_stream_info_.height;
-    tex_scale_x_ = static_cast<float>(rgb_width_ - 1);
-    tex_scale_y_ = static_cast<float>(rgb_height_ - 1);
+    initialize_rgb_parameters();
 
     return true;
   }
