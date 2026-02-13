@@ -1496,11 +1496,10 @@ private:
           std::memcpy(&rgb_float, &rgb_packed, sizeof(float));
           **iter_rgb = rgb_float;
           ++colored_count;
-          ++(*iter_rgb);
         } else {
           **iter_rgb = std::numeric_limits<float>::quiet_NaN();
-          ++(*iter_rgb);
         }
+        ++(*iter_rgb);
       }
     }
 
