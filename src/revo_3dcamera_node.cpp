@@ -554,6 +554,11 @@ private:
     ERROR_CODE ret = camera_->startStream(depth_stream_info_, rgb_stream_info_, &RevopointCameraNode::frame_pair_callback, this);
     if (ret == SUCCESS)
     {
+      // Pre-compute RGB frame dimensions and texture scale factors once at stream start
+      rgb_width_ = rgb_stream_info_.width;
+      rgb_height_ = rgb_stream_info_.height;
+      tex_scale_x_ = static_cast<float>(rgb_width_ - 1);
+      tex_scale_y_ = static_cast<float>(rgb_height_ - 1);
       return true;
     }
 
@@ -573,6 +578,12 @@ private:
       camera_->stopStream(STREAM_TYPE_DEPTH);
       return false;
     }
+
+    // Pre-compute RGB frame dimensions and texture scale factors once at stream start
+    rgb_width_ = rgb_stream_info_.width;
+    rgb_height_ = rgb_stream_info_.height;
+    tex_scale_x_ = static_cast<float>(rgb_width_ - 1);
+    tex_scale_y_ = static_cast<float>(rgb_height_ - 1);
 
     return true;
   }
@@ -1465,12 +1476,6 @@ private:
     const auto & points = pc.getVertices();
     const auto & textures = pc.getTexcoords();
     
-    // Pre-compute RGB frame dimensions and scale factors to avoid repeated function calls
-    const int rgb_width = has_rgb_frame ? frame_rgb->getWidth() : 0;
-    const int rgb_height = has_rgb_frame ? frame_rgb->getHeight() : 0;
-    const float tex_scale_x = has_rgb_frame ? static_cast<float>(rgb_width - 1) : 0.0f;
-    const float tex_scale_y = has_rgb_frame ? static_cast<float>(rgb_height - 1) : 0.0f;
-    
     for (size_t i = 0; i < points.size(); ++i, ++iter_x, ++iter_y, ++iter_z) {
       const cs::float3 & pt = points[i];
       // SDK outputs points in millimeters, convert to meters for ROS
@@ -1481,12 +1486,12 @@ private:
       if (iter_rgb && i < textures.size()) {
         const cs::float2 & tex = textures[i];
         // Texture coords are normalized [0,1], convert to pixel coords using pre-computed scale
-        const int tex_x = static_cast<int>(tex.u * tex_scale_x);
-        const int tex_y = static_cast<int>(tex.v * tex_scale_y);
+        const int tex_x = static_cast<int>(tex.u * tex_scale_x_);
+        const int tex_y = static_cast<int>(tex.v * tex_scale_y_);
 
-        if (tex_x >= 0 && tex_x < rgb_width &&
-            tex_y >= 0 && tex_y < rgb_height) {
-          const size_t idx = (tex_y * rgb_width + tex_x) * 3;
+        if (tex_x >= 0 && tex_x < rgb_width_ &&
+            tex_y >= 0 && tex_y < rgb_height_) {
+          const size_t idx = (tex_y * rgb_width_ + tex_x) * 3;
           
           // Pack RGB into float (RGB order: R=idx+0, G=idx+1, B=idx+2)
           const uint32_t rgb_packed = (static_cast<uint32_t>(rgb_data[idx + 0]) << 16) |  // R
@@ -1552,6 +1557,12 @@ private:
 
   float depth_scale_ = 1.0f;  // Depth scale in meters/unit (for ROS)
   float depth_scale_sdk_ = 0.1f;  // Depth scale in mm/unit (for SDK generatePoints)
+
+  // Pre-computed RGB stream parameters (set once at stream start)
+  int rgb_width_ = 0;
+  int rgb_height_ = 0;
+  float tex_scale_x_ = 0.0f;
+  float tex_scale_y_ = 0.0f;
 
   Intrinsics depth_intrinsics_{};
   Intrinsics rgb_intrinsics_{};
