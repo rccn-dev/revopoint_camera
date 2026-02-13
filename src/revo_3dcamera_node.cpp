@@ -1471,12 +1471,6 @@ private:
     const float tex_scale_x = has_rgb_frame ? static_cast<float>(rgb_width - 1) : 0.0f;
     const float tex_scale_y = has_rgb_frame ? static_cast<float>(rgb_height - 1) : 0.0f;
     
-    // Union for efficient RGB packing without memcpy
-    union RGBUnion {
-      uint32_t packed;
-      float as_float;
-    };
-    
     for (size_t i = 0; i < points.size(); ++i, ++iter_x, ++iter_y, ++iter_z) {
       const cs::float3 & pt = points[i];
       // SDK outputs points in millimeters, convert to meters for ROS
@@ -1494,12 +1488,13 @@ private:
             tex_y >= 0 && tex_y < rgb_height) {
           const size_t idx = (tex_y * rgb_width + tex_x) * 3;
           
-          // Pack RGB into float using union for efficiency
-          RGBUnion rgb_union;
-          rgb_union.packed = (static_cast<uint32_t>(rgb_data[idx + 0]) << 16) |
-                             (static_cast<uint32_t>(rgb_data[idx + 1]) << 8) |
-                             static_cast<uint32_t>(rgb_data[idx + 2]);
-          **iter_rgb = rgb_union.as_float;
+          // Pack RGB into float
+          const uint32_t rgb_packed = (static_cast<uint32_t>(rgb_data[idx + 0]) << 16) |
+                                      (static_cast<uint32_t>(rgb_data[idx + 1]) << 8) |
+                                      static_cast<uint32_t>(rgb_data[idx + 2]);
+          float rgb_float;
+          std::memcpy(&rgb_float, &rgb_packed, sizeof(float));
+          **iter_rgb = rgb_float;
           ++colored_count;
           ++(*iter_rgb);
         } else {
