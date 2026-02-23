@@ -153,25 +153,26 @@ private:
    */
   rclcpp::QoS get_qos() const
   {
-    // Parse QoS profile string and return appropriate QoS
-    if (qos_profile_ == "reliable")
-    {
-      // Reliable QoS with history depth of 10
-      return rclcpp::QoS(rclcpp::KeepLast(10)).reliable();
-    }
-    else if (qos_profile_ == "best_effort" || qos_profile_ == "sensor_data")
-    {
-      // Best effort QoS (SensorDataQoS)
-      return rclcpp::SensorDataQoS();
-    }
-    else
-    {
-      RCLCPP_WARN_ONCE(get_logger(), 
-        "Unknown QoS profile '%s', defaulting to 'reliable'. "
-        "Valid options are: 'reliable', 'best_effort', 'sensor_data'", 
-        qos_profile_.c_str());
-      return rclcpp::QoS(rclcpp::KeepLast(10)).reliable();
-    }
+    // // Parse QoS profile string and return appropriate QoS
+    // if (qos_profile_ == "reliable")
+    // {
+    //   // Reliable QoS with history depth of 10
+    //   return rclcpp::QoS(rclcpp::KeepLast(10)).reliable();
+    // }
+    // else if (qos_profile_ == "best_effort" || qos_profile_ == "sensor_data")
+    // {
+    //   // Best effort QoS (SensorDataQoS)
+    //   return rclcpp::SensorDataQoS();
+    // }
+    // else
+    // {
+    //   RCLCPP_WARN_ONCE(get_logger(), 
+    //     "Unknown QoS profile '%s', defaulting to 'reliable'. "
+    //     "Valid options are: 'reliable', 'best_effort', 'sensor_data'", 
+    //     qos_profile_.c_str());
+    //   return rclcpp::QoS(rclcpp::KeepLast(10)).reliable();
+    // }
+    return rclcpp::QoS(10).reliable().durability_volatile();
   }
 
   bool hardware_reset(const CameraInfo * info)
@@ -1241,21 +1242,55 @@ private:
 
   void handle_frame_pair(cs::IFramePtr frame_dep, cs::IFramePtr frame_rgb)
   {
-    // Update frame timestamp for watchdog (nanoseconds from steady_clock epoch, unspecified)
-    auto now = std::chrono::steady_clock::now();
+    // 1. Update internal health monitoring first
+    auto now_system = std::chrono::steady_clock::now();
     int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-      now.time_since_epoch()).count();
+      now_system.time_since_epoch()).count();
     last_frame_time_ns_.store(now_ns);
     frame_count_.fetch_add(1);
-    
-    if (!frame_dep || frame_dep->empty())
+
+    // 2. Generate a SINGLE timestamp for all messages in this cycle
+    rclcpp::Time stamp = this->get_clock()->now();
+
+    // --- OPTIMIZATION: PUBLISH RGB FIRST FOR MOVEIT ---
+    // MoveIt's Hand-Eye plugin subscribes to the RGB stream. By publishing this 
+    // immediately, we ensure the Image and CameraInfo arrive at Rviz with minimal 
+    // delay, preventing the 'Synchronizer' from dropping the pair.
+    if (frame_rgb && !frame_rgb->empty())
     {
-      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000, "Received empty depth frame");
-      error_count_.fetch_add(1);
-      return;
+      sensor_msgs::msg::Image rgb_msg;
+      rgb_msg.header.stamp = stamp;
+      rgb_msg.header.frame_id = rgb_frame_id_;
+      rgb_msg.height = frame_rgb->getHeight();
+      rgb_msg.width = frame_rgb->getWidth();
+      rgb_msg.encoding = sensor_msgs::image_encodings::RGB8;
+      rgb_msg.step = static_cast<uint32_t>(rgb_msg.width * 3);
+      
+      size_t rgb_size = rgb_msg.step * rgb_msg.height;
+      rgb_msg.data.resize(rgb_size);
+      const char * rgb_data = frame_rgb->getData();
+      if (rgb_data) {
+        std::memcpy(rgb_msg.data.data(), rgb_data, rgb_size);
+        
+        // Prepare Info
+        sensor_msgs::msg::CameraInfo rgb_info = rgb_info_msg_;
+        rgb_info.header.stamp = stamp;
+        
+        // Ensure Distortion vector is not empty (MoveIt requirement)
+        if (rgb_info.d.empty()) {
+            rgb_info.d = {0.0, 0.0, 0.0, 0.0, 0.0};
+        }
+
+        // Publish as a tight pair
+        rgb_pub_->publish(rgb_msg);
+        rgb_info_pub_->publish(rgb_info);
+      }
     }
 
-    rclcpp::Time stamp = this->get_clock()->now();
+    // --- DEPTH PROCESSING ---
+    if (!frame_dep || frame_dep->empty()) {
+      return;
+    }
 
     sensor_msgs::msg::Image depth_msg;
     depth_msg.header.stamp = stamp;
@@ -1263,50 +1298,37 @@ private:
     depth_msg.height = frame_dep->getHeight();
     depth_msg.width = frame_dep->getWidth();
     depth_msg.encoding = sensor_msgs::image_encodings::TYPE_16UC1;
-    depth_msg.is_bigendian = false;
     depth_msg.step = static_cast<uint32_t>(depth_msg.width * sizeof(uint16_t));
-
-    const std::size_t depth_size = depth_msg.step * depth_msg.height;
-    depth_msg.data.resize(depth_size);
-
-    const char * depth_data = frame_dep->getData(FRAME_DATA_FORMAT_Z16);
-    if (!depth_data)
-    {
-      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000, "Failed to get depth data from frame");
-      error_count_.fetch_add(1);
-      return;
-    }
     
-    // Copy raw depth data first (for pointcloud generation)
-    std::memcpy(depth_msg.data.data(), depth_data, depth_size);
+    size_t depth_size = depth_msg.step * depth_msg.height;
+    depth_msg.data.resize(depth_size);
+    const char * depth_data = frame_dep->getData(FRAME_DATA_FORMAT_Z16);
+    
+    if (depth_data) {
+      std::memcpy(depth_msg.data.data(), depth_data, depth_size);
 
-    sensor_msgs::msg::CameraInfo depth_info = depth_info_msg_;
-    depth_info.header.stamp = stamp;
+      // Prepare Depth Info
+      sensor_msgs::msg::CameraInfo depth_info = depth_info_msg_;
+      depth_info.header.stamp = stamp;
 
-    // Generate pointcloud BEFORE scaling depth image (uses raw SDK units)
-    if (publish_pointcloud_ && cloud_pub_)
-    {
-      publish_pointcloud(depth_msg, frame_rgb);
-    }
+      // 3. Heavy logic (Pointcloud and Scaling) happens AFTER RGB is already on the wire
+      if (publish_pointcloud_ && cloud_pub_) {
+        publish_pointcloud(depth_msg, frame_rgb);
+      }
 
-    // Now scale depth values for visualization in RVIZ
-    // SDK depth values use depth_scale_sdk_ (e.g., 0.05 mm/unit)
-    // ROS/RVIZ expects depth in millimeters (1.0 mm/unit)
-    if (depth_scale_sdk_ != 1.0f)
-    {
-      uint16_t * dst = reinterpret_cast<uint16_t *>(depth_msg.data.data());
-      const float scale_factor = depth_scale_sdk_;
-      
-      for (size_t i = 0; i < depth_msg.width * depth_msg.height; ++i) {
-        if (dst[i] != 0) {
-          float depth_mm = dst[i] * scale_factor;
-          dst[i] = static_cast<uint16_t>(std::min(depth_mm, 65535.0f));
+      if (depth_scale_sdk_ != 1.0f) {
+        uint16_t * dst = reinterpret_cast<uint16_t *>(depth_msg.data.data());
+        float scale_factor = depth_scale_sdk_;
+        for (size_t i = 0; i < depth_msg.width * depth_msg.height; ++i) {
+          if (dst[i] != 0) {
+            float depth_mm = dst[i] * scale_factor;
+            dst[i] = static_cast<uint16_t>(std::min(depth_mm, 65535.0f));
+          }
         }
       }
-    }
 
-    depth_pub_->publish(depth_msg);
-    depth_info_pub_->publish(depth_info);
+      depth_pub_->publish(depth_msg);
+      depth_info_pub_->publish(depth_info);
 
     // Publish colorized depth visualization if enabled
     if (publish_depth_viz_ && depth_viz_pub_)
@@ -1370,43 +1392,8 @@ private:
       }
 
       depth_viz_pub_->publish(depth_viz_msg);
+      }
     }
-
-    if (!frame_rgb || frame_rgb->empty())
-    {
-      // RGB frame is optional in some camera modes. When using depth-only mode or when
-      // RGB camera is not configured, we don't treat this as an error. The depth data
-      // is still valid and can be published independently.
-      return;
-    }
-
-    sensor_msgs::msg::Image rgb_msg;
-    rgb_msg.header.stamp = stamp;
-    rgb_msg.header.frame_id = rgb_frame_id_;
-    rgb_msg.height = frame_rgb->getHeight();
-    rgb_msg.width = frame_rgb->getWidth();
-    rgb_msg.encoding = sensor_msgs::image_encodings::RGB8;
-    rgb_msg.is_bigendian = false;
-    rgb_msg.step = static_cast<uint32_t>(rgb_msg.width * 3);
-
-    const std::size_t rgb_size = rgb_msg.step * rgb_msg.height;
-    rgb_msg.data.resize(rgb_size);
-
-    const char * rgb_data = frame_rgb->getData();
-    if (!rgb_data)
-    {
-      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000, "Failed to get RGB data from frame");
-      error_count_.fetch_add(1);
-      return;
-    }
-    
-    std::memcpy(rgb_msg.data.data(), rgb_data, rgb_size);
-
-    sensor_msgs::msg::CameraInfo rgb_info = rgb_info_msg_;
-    rgb_info.header.stamp = stamp;
-
-    rgb_pub_->publish(rgb_msg);
-    rgb_info_pub_->publish(rgb_info);
   }
 
   void publish_pointcloud(const sensor_msgs::msg::Image & depth_msg, cs::IFramePtr frame_rgb)

@@ -164,3 +164,7 @@ For issues related to stream monitoring or silent failures, please include:
 - Timeout threshold used
 - Camera model and firmware version
 - USB connection type (2.0, 3.0, etc.)
+
+## Known Issue
+
+QoS is hardcoded to reliable.
