@@ -34,6 +34,7 @@ def generate_launch_description():
         "depth_range_max_mm": 2000,
         "algorithm_contrast": 0,
         "publish_pointcloud": True,
+        "align_depth": True,
         "publish_depth_viz": False,
         "qos_profile": "reliable",
         "enable_watchdog": True,
@@ -41,15 +42,21 @@ def generate_launch_description():
     }
 
     namespace = LaunchConfiguration("namespace")
+    publish_pointcloud = LaunchConfiguration("publish_pointcloud")
+    align_depth = LaunchConfiguration("align_depth")
     publish_depth_viz = LaunchConfiguration("publish_depth_viz")
     qos_profile = LaunchConfiguration("qos_profile")
 
     # Update params with launch configuration
+    params["publish_pointcloud"] = publish_pointcloud
+    params["align_depth"] = align_depth
     params["publish_depth_viz"] = publish_depth_viz
     params["qos_profile"] = qos_profile
 
     return launch.LaunchDescription([
         DeclareLaunchArgument("namespace", default_value="camera"),
+        DeclareLaunchArgument("publish_pointcloud", default_value="true"),
+        DeclareLaunchArgument("align_depth", default_value="true"),
         DeclareLaunchArgument("publish_depth_viz", default_value="false"),
         DeclareLaunchArgument("qos_profile", default_value="reliable"),
         launch_ros.actions.Node(

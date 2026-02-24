@@ -77,6 +77,7 @@ public:
     algorithm_contrast_ = declare_parameter<int>("algorithm_contrast", 0);
 
     publish_pointcloud_ = declare_parameter<bool>("publish_pointcloud", false);
+    align_depth_ = declare_parameter<bool>("align_depth", true);
     publish_depth_viz_ = declare_parameter<bool>("publish_depth_viz", false);
     qos_profile_ = declare_parameter<std::string>("qos_profile", "reliable");
 
@@ -1008,14 +1009,17 @@ private:
       }
     }
 
-    PropertyExtension match;
-    match.depthRgbMatchParam.iDifThreshold = depth_rgb_match_threshold_;
-    match.depthRgbMatchParam.iRgbOffset = depth_rgb_match_rgb_offset_;
-    match.depthRgbMatchParam.bMakeSureRgbIsAfterDepth = depth_rgb_match_force_rgb_after_depth_;
-    ERROR_CODE ret = camera_->setPropertyExtension(PROPERTY_EXT_DEPTH_RGB_MATCH_PARAM, match);
-    if (ret != SUCCESS)
+    if (align_depth_)
     {
-      RCLCPP_WARN(get_logger(), "Failed to set depth/rgb match params (ret=%d)", ret);
+      PropertyExtension match;
+      match.depthRgbMatchParam.iDifThreshold = depth_rgb_match_threshold_;
+      match.depthRgbMatchParam.iRgbOffset = depth_rgb_match_rgb_offset_;
+      match.depthRgbMatchParam.bMakeSureRgbIsAfterDepth = depth_rgb_match_force_rgb_after_depth_;
+      ERROR_CODE ret = camera_->setPropertyExtension(PROPERTY_EXT_DEPTH_RGB_MATCH_PARAM, match);
+      if (ret != SUCCESS)
+      {
+        RCLCPP_WARN(get_logger(), "Failed to set depth/rgb match params (ret=%d)", ret);
+      }
     }
   }
 
@@ -1325,7 +1329,7 @@ private:
 
       // 3. Heavy logic (Pointcloud and Scaling) happens AFTER RGB is already on the wire
       if (publish_pointcloud_ && cloud_pub_) {
-        publish_pointcloud(depth_msg, frame_rgb);
+        publish_pointcloud(depth_msg, align_depth_ ? frame_rgb : nullptr);
       }
 
       if (depth_scale_sdk_ != 1.0f) {
@@ -1535,6 +1539,7 @@ private:
   int algorithm_contrast_ = 0;
 
   bool publish_pointcloud_ = false;
+  bool align_depth_ = true;
   bool publish_depth_viz_ = false;
 
   std::string qos_profile_;
