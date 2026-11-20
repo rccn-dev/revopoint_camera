@@ -167,4 +167,6 @@ For issues related to stream monitoring or silent failures, please include:
 
 ## Known Issue
 
-QoS is hardcoded to reliable.
+stream FPS is limited to ~5.5 fps over Ethernet due to hardware/network constraints, not a driver issue. See `revopoint_camera_investigation.md` for details.
+
+RGB stream is capped with depth stream due to hardware limitations, when setting stream profiles, the mechanism need to be refine.

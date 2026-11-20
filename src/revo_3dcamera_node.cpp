@@ -4,6 +4,7 @@
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <condition_variable>
 #include <string>
 #include <thread>
 #include <vector>
@@ -57,13 +58,8 @@ public:
     depth_frame_time_us_ = declare_parameter<double>("depth_frame_time_us", 7500.0);
     depth_gain_ = declare_parameter<double>("depth_gain", 1.0);
     trigger_mode_ = declare_parameter<int>("trigger_mode", static_cast<int>(TRIGGER_MODE_OFF));
-    depth_rgb_match_threshold_ = declare_parameter<int>("depth_rgb_match_threshold", 0);
-    depth_rgb_match_rgb_offset_ = declare_parameter<int>("depth_rgb_match_rgb_offset", 0);
-    depth_rgb_match_force_rgb_after_depth_ = declare_parameter<bool>(
-      "depth_rgb_match_force_rgb_after_depth", false);
 
     initial_reset_ = declare_parameter<bool>("initial_reset", false);
-    clear_frame_buffer_ = declare_parameter<bool>("clear_frame_buffer", false);
 
     laser_enable_ = declare_parameter<bool>("laser_enable", true);
     laser_luminance_ = declare_parameter<int>("laser_luminance", 100);
@@ -79,7 +75,7 @@ public:
     publish_pointcloud_ = declare_parameter<bool>("publish_pointcloud", false);
     align_depth_ = declare_parameter<bool>("align_depth", true);
     publish_depth_viz_ = declare_parameter<bool>("publish_depth_viz", false);
-    qos_profile_ = declare_parameter<std::string>("qos_profile", "reliable");
+    qos_profile_ = declare_parameter<std::string>("qos_profile", "sensor_data");
 
     depth_pub_ = create_publisher<sensor_msgs::msg::Image>("depth/image_raw", get_qos());
     rgb_pub_ = create_publisher<sensor_msgs::msg::Image>("rgb/image_raw", get_qos());
@@ -117,6 +113,9 @@ public:
     {
       RCLCPP_ERROR(get_logger(), "Failed to start camera");
     }
+
+    // Start dedicated publisher threads (decouples SDK callbacks from ROS publishing)
+    start_publisher_threads();
     
     // Start watchdog timer if enabled
     if (enable_watchdog_)
@@ -136,6 +135,8 @@ public:
       watchdog_timer_->cancel();
       watchdog_timer_.reset();
     }
+    // Stop publisher threads before disconnecting camera
+    stop_publisher_threads();
     stop_camera();
   }
 
@@ -154,65 +155,110 @@ private:
    */
   rclcpp::QoS get_qos() const
   {
-    // // Parse QoS profile string and return appropriate QoS
-    // if (qos_profile_ == "reliable")
-    // {
-    //   // Reliable QoS with history depth of 10
-    //   return rclcpp::QoS(rclcpp::KeepLast(10)).reliable();
-    // }
-    // else if (qos_profile_ == "best_effort" || qos_profile_ == "sensor_data")
-    // {
-    //   // Best effort QoS (SensorDataQoS)
-    //   return rclcpp::SensorDataQoS();
-    // }
-    // else
-    // {
-    //   RCLCPP_WARN_ONCE(get_logger(), 
-    //     "Unknown QoS profile '%s', defaulting to 'reliable'. "
-    //     "Valid options are: 'reliable', 'best_effort', 'sensor_data'", 
-    //     qos_profile_.c_str());
-    //   return rclcpp::QoS(rclcpp::KeepLast(10)).reliable();
-    // }
-    return rclcpp::QoS(10).reliable().durability_volatile();
+    // Parse QoS profile string and return appropriate QoS
+    if (qos_profile_ == "reliable")
+    {
+      // Reliable QoS with history depth of 10
+      return rclcpp::QoS(rclcpp::KeepLast(10)).reliable().durability_volatile();
+    }
+    else if (qos_profile_ == "best_effort" || qos_profile_ == "sensor_data")
+    {
+      // Best effort QoS (SensorDataQoS) — recommended for image streams
+      return rclcpp::SensorDataQoS();
+    }
+    else
+    {
+      RCLCPP_WARN_ONCE(get_logger(), 
+        "Unknown QoS profile '%s', defaulting to 'sensor_data'. "
+        "Valid options are: 'reliable', 'best_effort', 'sensor_data'", 
+        qos_profile_.c_str());
+      return rclcpp::SensorDataQoS();
+    }
   }
 
-  bool hardware_reset(const CameraInfo * info)
+  /**
+   * @brief Perform a clean camera restart via the C++ SDK restart() API.
+   *
+   * The Revopoint camera firmware retains internal state (frame rate, resolution
+   * settings) across stop/start and even disconnect/reconnect cycles.  A full
+   * restart is the only reliable way to clear that state and obtain predictable
+   * frame rates on the next connection.
+   *
+   * Sequence: restart() → disconnect() → wait → re-discover → reconnect.
+   */
+  bool restart_camera_clean()
   {
-    CSystem * sys = createSystem();
-    if (!sys)
-    {
-      RCLCPP_WARN(get_logger(), "Hardware reset: failed to create C system context");
+    if (!camera_) {
+      RCLCPP_WARN(get_logger(), "restart_camera_clean: no camera object");
       return false;
     }
 
-    CameraInfo temp{};
-    if (!serial_.empty())
-    {
-      std::strncpy(temp.serial, serial_.c_str(), sizeof(temp.serial) - 1);
-      temp.serial[sizeof(temp.serial) - 1] = '\0';
+    RCLCPP_INFO(get_logger(), "Restarting camera for clean state...");
+    ERROR_CODE ret = camera_->restart();
+    if (ret != SUCCESS) {
+      RCLCPP_WARN(get_logger(), "camera->restart() failed (ret=%d), attempting disconnect anyway", ret);
     }
 
-    CameraInfo * connect_info = info ? const_cast<CameraInfo *>(info) : &temp;
-    CCamera * cam = systemConnectCamera(sys, connect_info);
-    if (!cam)
-    {
-      RCLCPP_WARN(get_logger(), "Hardware reset: failed to connect C camera");
-      deleteSystem(sys);
-      return false;
+    camera_->disconnect();
+    camera_.reset();
+
+    // Camera needs time to reboot firmware (empirically 5-10s over Ethernet)
+    RCLCPP_INFO(get_logger(), "Waiting 8 seconds for camera firmware reboot...");
+    std::this_thread::sleep_for(8s);
+
+    // Re-discover and reconnect
+    cs::ISystemPtr system = cs::getSystemPtr();
+    for (int attempt = 0; attempt < 10; ++attempt) {
+      std::vector<CameraInfo> cameras;
+      ret = system->queryCameras(cameras);
+      if (ret != SUCCESS || cameras.empty()) {
+        RCLCPP_INFO(get_logger(), "Waiting for camera to reappear (%d/10)...", attempt + 1);
+        std::this_thread::sleep_for(2s);
+        continue;
+      }
+
+      CameraInfo selected = cameras[0];
+      if (!serial_.empty()) {
+        for (const auto & info : cameras) {
+          if (serial_ == info.serial) { selected = info; break; }
+        }
+      }
+
+      camera_ = cs::getCameraPtr();
+      ret = camera_->connect(selected);
+      if (ret != SUCCESS) {
+        RCLCPP_WARN(get_logger(), "Reconnect failed (ret=%d), retry %d/10", ret, attempt + 1);
+        camera_.reset();
+        std::this_thread::sleep_for(2s);
+        continue;
+      }
+
+      // Verify camera is responsive
+      CameraInfo check{};
+      if (camera_->getInfo(check) != SUCCESS) {
+        RCLCPP_WARN(get_logger(), "Camera connected but not responsive, retry %d/10", attempt + 1);
+        camera_->disconnect();
+        camera_.reset();
+        std::this_thread::sleep_for(2s);
+        continue;
+      }
+
+      // Wait for stream infos to become available
+      if (!wait_for_stream_infos(10, 500ms)) {
+        RCLCPP_WARN(get_logger(), "Stream infos not ready after reconnect, retry %d/10", attempt + 1);
+        camera_->disconnect();
+        camera_.reset();
+        std::this_thread::sleep_for(2s);
+        continue;
+      }
+
+      log_camera_info();
+      RCLCPP_INFO(get_logger(), "Camera restarted and reconnected successfully");
+      return true;
     }
 
-    ERROR_CODE ret = cameraReset(cam);
-    systemDisconnectCamera(sys, cam);
-    deleteSystem(sys);
-
-    if (ret != SUCCESS)
-    {
-      RCLCPP_WARN(get_logger(), "Hardware reset request failed (ret=%d)", ret);
-      return false;
-    }
-
-    RCLCPP_INFO(get_logger(), "Hardware reset request sent");
-    return true;
+    RCLCPP_ERROR(get_logger(), "Failed to reconnect after restart (10 attempts)");
+    return false;
   }
 
   bool wait_for_stream_infos(int retries, std::chrono::milliseconds delay)
@@ -237,246 +283,126 @@ private:
     return false;
   }
 
-  bool reconnect_after_restart(const std::string & serial, CameraInfo * connected_info)
+  // reconnect_after_restart and restart_and_reconnect consolidated into
+  // restart_camera_clean() above.
+
+  /**
+   * @brief Main camera initialization sequence.
+   *
+   * Key learnings from SDK benchmarking:
+   *   - The camera firmware retains state between sessions. A full restart()
+   *     + disconnect/reconnect is the ONLY way to get a clean, predictable
+   *     frame rate.  Without it, fps degrades progressively.
+   *   - RGB frames are ONLY delivered when depth is also streaming (hardware
+   *     constraint — the structured-light projector clocks the RGB sensor).
+   *   - RGB frame rate is internally matched to depth frame rate by the
+   *     camera firmware.
+   *   - Network camera discovery requires setSdkEnableNetworking(true) and
+   *     setEnableNetworking(true) before queryCameras().
+   *
+   * Sequence:
+   *   1. Enable SDK networking (for Ethernet cameras)
+   *   2. Discover and connect to camera
+   *   3. If initial_reset: restart firmware for clean state
+   *   4. Wait for stream info availability
+   *   5. Select depth + RGB streams
+   *   6. Configure camera properties (exposure, laser, etc.)
+   *   7. Start depth stream first, let it settle, then start RGB
+   *   8. Read camera info (intrinsics, extrinsics, depth scale)
+   */
+  bool start_camera()
   {
-    camera_.reset();
+    // Step 1: Enable networking for Ethernet cameras
+    cs::setSdkEnableNetworking(true);
+    cs::setEnableNetworking(true);
+    RCLCPP_INFO(get_logger(), "SDK networking enabled for Ethernet camera discovery");
+
+    // Step 2: Discover cameras with retry (network cameras take time to appear)
     cs::ISystemPtr system = cs::getSystemPtr();
+    std::vector<CameraInfo> cameras;
+    ERROR_CODE ret;
 
-    for (int i = 0; i < 20; ++i)
-    {
-      std::vector<CameraInfo> cameras;
-      ERROR_CODE ret = system->queryCameras(cameras);
-      if (ret == SUCCESS && !cameras.empty())
-      {
-        CameraInfo selected = cameras[0];
-        if (!serial.empty())
-        {
-          for (const auto & info : cameras)
-          {
-            if (serial == info.serial)
-            {
-              selected = info;
-              break;
-            }
-          }
-        }
-
-        camera_ = cs::getCameraPtr();
-        ret = serial.empty() ? camera_->connect() : camera_->connect(selected);
-        if (ret == SUCCESS)
-        {
-          if (connected_info)
-          {
-            *connected_info = selected;
-          }
-          return true;
-        }
-      }
-
-      std::this_thread::sleep_for(500ms);
+    RCLCPP_INFO(get_logger(), "Searching for cameras...");
+    for (int i = 0; i < 20; ++i) {
+      ret = system->queryCameras(cameras);
+      if (ret == SUCCESS && !cameras.empty()) break;
+      if (i < 19) std::this_thread::sleep_for(500ms);
     }
 
-    camera_ = cs::getCameraPtr();
-    ERROR_CODE ret = camera_->connect();
-    if (ret == SUCCESS)
-    {
-      if (connected_info)
-      {
-        camera_->getInfo(*connected_info);
-      }
-      return true;
-    }
-
-    return false;
-  }
-
-  bool restart_and_reconnect(const std::string & serial, CameraInfo * connected_info)
-  {
-    ERROR_CODE ret = camera_->restart();
-    if (ret != SUCCESS)
-    {
-      RCLCPP_WARN(get_logger(), "Camera restart failed (ret=%d)", ret);
+    if (cameras.empty()) {
+      RCLCPP_ERROR(get_logger(), "No cameras found after 10 seconds (ret=%d)", ret);
       return false;
     }
 
-    camera_->disconnect();
-    std::this_thread::sleep_for(8s);
+    RCLCPP_INFO(get_logger(), "Found %zu camera(s)", cameras.size());
 
-    for (int attempt = 0; attempt < 5; ++attempt)
-    {
-      if (!reconnect_after_restart(serial, connected_info))
-      {
-        std::this_thread::sleep_for(1s);
-        continue;
-      }
-
-      CameraInfo info_check{};
-      if (camera_->getInfo(info_check) != SUCCESS)
-      {
-        RCLCPP_WARN(get_logger(), "Camera connected but info not ready, retry %d/5", attempt + 1);
-        camera_->disconnect();
-        std::this_thread::sleep_for(1s);
-        continue;
-      }
-
-      if (!wait_for_stream_infos(10, 500ms))
-      {
-        RCLCPP_WARN(get_logger(), "Stream infos not ready after reconnect, retry %d/5", attempt + 1);
-        camera_->disconnect();
-        std::this_thread::sleep_for(1s);
-        continue;
-      }
-
-      log_camera_info();
-      return true;
-    }
-
-    RCLCPP_ERROR(get_logger(), "Failed to reconnect and get stream infos after restart");
-    return false;
-  }
-
-  bool start_camera()
-  {
-    cs::ISystemPtr system = cs::getSystemPtr();
-    std::vector<CameraInfo> cameras;
-    ERROR_CODE ret = system->queryCameras(cameras);
-    if (ret != SUCCESS || cameras.empty())
-    {
-      RCLCPP_WARN(get_logger(), "No cameras found by queryCameras (ret=%d, count=%zu). Trying direct connect...", ret, cameras.size());
-      camera_ = cs::getCameraPtr();
-      ret = camera_->connect();
-      if (ret != SUCCESS)
-      {
-        RCLCPP_ERROR(get_logger(), "Direct connect failed (ret=%d)", ret);
-        return false;
-      }
-
-      log_camera_info();
-
-      if (initial_reset_)
-      {
-        RCLCPP_WARN(get_logger(), "Initial reset requested: restarting camera");
-        if (!restart_and_reconnect(serial_, nullptr))
-        {
-          return false;
-        }
-      }
-
-      if (clear_frame_buffer_)
-      {
-        PropertyExtension clear;
-        clear.streamType = STREAM_TYPE_DEPTH;
-        if (camera_->setPropertyExtension(PROPERTY_EXT_CLEAR_FRAME_BUFFER, clear) != SUCCESS)
-        {
-          RCLCPP_WARN(get_logger(), "Failed to clear depth frame buffer");
-        }
-        clear.streamType = STREAM_TYPE_RGB;
-        if (camera_->setPropertyExtension(PROPERTY_EXT_CLEAR_FRAME_BUFFER, clear) != SUCCESS)
-        {
-          RCLCPP_WARN(get_logger(), "Failed to clear RGB frame buffer");
-        }
-      }
-
-      if (!initial_reset_ && !wait_for_stream_infos(10, 500ms))
-      {
-        RCLCPP_ERROR(get_logger(), "Depth/RGB stream infos not available after reconnect");
-        return false;
-      }
-
-      if (!select_streams())
-      {
-        return false;
-      }
-
-      if (!start_streams())
-      {
-        RCLCPP_ERROR(get_logger(), "Failed to start streams");
-        return false;
-      }
-
-      configure_depth_exposure();
-      configure_laser();
-      configure_leds();
-      configure_depth_controls();
-      update_camera_info();
-
-      return true;
-    }
-
+    // Select camera by serial or use first available
     CameraInfo selected = cameras[0];
-    if (!serial_.empty())
-    {
+    if (!serial_.empty()) {
       bool found = false;
-      for (const auto & info : cameras)
-      {
-        if (serial_ == info.serial)
-        {
+      for (const auto & info : cameras) {
+        if (serial_ == info.serial) {
           selected = info;
           found = true;
           break;
         }
       }
-      if (!found)
-      {
-        RCLCPP_WARN(get_logger(), "Serial %s not found, using first camera", serial_.c_str());
+      if (!found) {
+        RCLCPP_WARN(get_logger(), "Serial '%s' not found, using first camera (%s)",
+          serial_.c_str(), selected.serial);
       }
     }
 
+    // Step 2b: Connect
     camera_ = cs::getCameraPtr();
     ret = camera_->connect(selected);
-    if (ret != SUCCESS)
-    {
+    if (ret != SUCCESS) {
       RCLCPP_ERROR(get_logger(), "Camera connect failed (ret=%d)", ret);
       return false;
     }
-
     log_camera_info();
 
-    if (initial_reset_)
-    {
-      RCLCPP_WARN(get_logger(), "Initial reset requested: restarting camera");
-      if (!restart_and_reconnect(serial_, &selected))
-      {
+    // Step 3: Restart for clean state if requested
+    // This is CRITICAL for predictable frame rates — the camera firmware retains
+    // internal state from previous sessions that degrades performance.
+    if (initial_reset_) {
+      RCLCPP_INFO(get_logger(), "Initial reset requested — restarting camera for clean state");
+      if (!restart_camera_clean()) {
+        RCLCPP_ERROR(get_logger(), "Camera restart failed");
+        return false;
+      }
+      // restart_camera_clean() leaves us connected with stream infos ready
+    }
+
+    // Step 4: Wait for stream infos
+    if (!initial_reset_ && !wait_for_stream_infos(10, 500ms)) {
+      // Stream infos not ready — try a restart as last resort
+      RCLCPP_WARN(get_logger(), "Stream infos not ready, attempting restart...");
+      if (!restart_camera_clean()) {
+        RCLCPP_ERROR(get_logger(), "Failed to get stream infos after restart");
         return false;
       }
     }
 
-    if (clear_frame_buffer_)
-    {
-      PropertyExtension clear;
-      clear.streamType = STREAM_TYPE_DEPTH;
-      if (camera_->setPropertyExtension(PROPERTY_EXT_CLEAR_FRAME_BUFFER, clear) != SUCCESS)
-      {
-        RCLCPP_WARN(get_logger(), "Failed to clear depth frame buffer");
-      }
-      clear.streamType = STREAM_TYPE_RGB;
-      if (camera_->setPropertyExtension(PROPERTY_EXT_CLEAR_FRAME_BUFFER, clear) != SUCCESS)
-      {
-        RCLCPP_WARN(get_logger(), "Failed to clear RGB frame buffer");
-      }
-    }
-
-    if (!initial_reset_ && !wait_for_stream_infos(10, 500ms))
-    {
-      RCLCPP_ERROR(get_logger(), "Depth/RGB stream infos not available after reconnect");
+    // Step 5: Select streams
+    if (!select_streams()) {
       return false;
     }
 
-    if (!select_streams())
-    {
-      return false;
-    }
+    // Step 6: Configure camera properties BEFORE starting streams
+    // (some properties like exposure/gain affect the stream pipeline)
+    configure_laser();
+    configure_leds();
+    configure_depth_exposure();
+    configure_depth_controls();
 
-    if (!start_streams())
-    {
+    // Step 7: Start streams (depth first, then RGB — RGB requires active depth)
+    if (!start_streams()) {
       RCLCPP_ERROR(get_logger(), "Failed to start streams");
       return false;
     }
 
-    configure_depth_exposure();
-    configure_laser();
-    configure_leds();
-    configure_depth_controls();
+    // Step 8: Read camera calibration data
     update_camera_info();
 
     return true;
@@ -484,12 +410,18 @@ private:
 
   void stop_camera()
   {
-    if (camera_)
-    {
-      camera_->stopStream();
-      camera_->disconnect();
-      camera_.reset();
-    }
+    if (!camera_) return;
+
+    // Stop streams in reverse order (RGB first since it depends on depth)
+    RCLCPP_INFO(get_logger(), "Stopping streams...");
+    camera_->stopStream(STREAM_TYPE_RGB);
+    std::this_thread::sleep_for(100ms);
+    camera_->stopStream(STREAM_TYPE_DEPTH);
+    std::this_thread::sleep_for(200ms);
+
+    camera_->disconnect();
+    camera_.reset();
+    RCLCPP_INFO(get_logger(), "Camera disconnected");
   }
 
   bool select_streams()
@@ -560,33 +492,46 @@ private:
     tex_scale_y_ = static_cast<float>(rgb_height_ - 1);
   }
 
+  /**
+   * @brief Start depth and RGB streams with proper sequencing.
+   *
+   * Camera hardware constraints (confirmed by benchmark):
+   *   - RGB cannot produce frames without an active depth stream
+   *   - RGB frame rate is internally matched to depth frame rate
+   *   - Depth needs a brief warm-up period before RGB starts reliably
+   */
   bool start_streams()
   {
-    ERROR_CODE ret = camera_->startStream(depth_stream_info_, rgb_stream_info_, &RevopointCameraNode::frame_pair_callback, this);
-    if (ret == SUCCESS)
-    {
-      initialize_rgb_parameters();
-      return true;
-    }
-
-    RCLCPP_WARN(get_logger(), "Paired stream start failed (ret=%d), falling back to sequential start", ret);
-
-    ret = camera_->startStream(STREAM_TYPE_DEPTH, depth_stream_info_, nullptr, nullptr);
-    if (ret != SUCCESS)
-    {
+    // Step 1: Start depth first — RGB depends on depth being active
+    ERROR_CODE ret = camera_->startStream(STREAM_TYPE_DEPTH, depth_stream_info_,
+      &RevopointCameraNode::depth_frame_callback, this);
+    if (ret != SUCCESS) {
       RCLCPP_ERROR(get_logger(), "Depth stream start failed (ret=%d)", ret);
       return false;
     }
+    RCLCPP_INFO(get_logger(), "Depth stream started (%dx%d, format=%d)",
+      depth_stream_info_.width, depth_stream_info_.height, depth_stream_info_.format);
 
-    ret = camera_->startStream(STREAM_TYPE_RGB, rgb_stream_info_, nullptr, nullptr);
-    if (ret != SUCCESS)
-    {
+    // Step 2: Let depth stream settle before starting RGB.
+    // The camera's structured-light projector needs to stabilize and begin
+    // clocking the RGB sensor. Without this delay, RGB may start with 0 fps.
+    RCLCPP_INFO(get_logger(), "Waiting 2s for depth stream to stabilize...");
+    std::this_thread::sleep_for(2s);
+
+    // Step 3: Start RGB (will be internally synced to depth rate by firmware)
+    ret = camera_->startStream(STREAM_TYPE_RGB, rgb_stream_info_,
+      &RevopointCameraNode::rgb_frame_callback, this);
+    if (ret != SUCCESS) {
       RCLCPP_ERROR(get_logger(), "RGB stream start failed (ret=%d)", ret);
       camera_->stopStream(STREAM_TYPE_DEPTH);
       return false;
     }
 
     initialize_rgb_parameters();
+    RCLCPP_INFO(get_logger(),
+      "Streams started: Depth %dx%d + RGB %dx%d (RGB synced to depth rate)",
+      depth_stream_info_.width, depth_stream_info_.height,
+      rgb_stream_info_.width, rgb_stream_info_.height);
 
     return true;
   }
@@ -1009,18 +954,10 @@ private:
       }
     }
 
-    if (align_depth_)
-    {
-      PropertyExtension match;
-      match.depthRgbMatchParam.iDifThreshold = depth_rgb_match_threshold_;
-      match.depthRgbMatchParam.iRgbOffset = depth_rgb_match_rgb_offset_;
-      match.depthRgbMatchParam.bMakeSureRgbIsAfterDepth = depth_rgb_match_force_rgb_after_depth_;
-      ERROR_CODE ret = camera_->setPropertyExtension(PROPERTY_EXT_DEPTH_RGB_MATCH_PARAM, match);
-      if (ret != SUCCESS)
-      {
-        RCLCPP_WARN(get_logger(), "Failed to set depth/rgb match params (ret=%d)", ret);
-      }
-    }
+    // NOTE: Do NOT set PROPERTY_EXT_DEPTH_RGB_MATCH_PARAM here.
+    // That property is for the getPairedFrame() polling API only. When used with
+    // independent callbacks it causes the SDK to hold frames for timestamp matching,
+    // starving both streams. The camera firmware already syncs RGB to depth internally.
   }
 
   void update_camera_info()
@@ -1234,79 +1171,214 @@ private:
     return cam_info;
   }
 
-  static void frame_pair_callback(cs::IFramePtr frame_dep, cs::IFramePtr frame_rgb, void * user_data)
+  // ---------------------------------------------------------------------------
+  // Independent stream callbacks
+  // ---------------------------------------------------------------------------
+
+  static void depth_frame_callback(cs::IFramePtr frame, void * user_data)
   {
     auto * self = static_cast<RevopointCameraNode *>(user_data);
     if (self)
     {
       try
       {
-        self->handle_frame_pair(frame_dep, frame_rgb);
+        self->handle_depth_frame(frame);
       }
       catch (const std::exception & e)
       {
-        RCLCPP_ERROR(self->get_logger(), "Exception in frame callback: %s", e.what());
+        RCLCPP_ERROR(self->get_logger(), "Exception in depth callback: %s", e.what());
         self->error_count_.fetch_add(1);
       }
       catch (...)
       {
-        RCLCPP_ERROR(self->get_logger(), "Unknown exception in frame callback");
+        RCLCPP_ERROR(self->get_logger(), "Unknown exception in depth callback");
         self->error_count_.fetch_add(1);
       }
     }
   }
 
-  void handle_frame_pair(cs::IFramePtr frame_dep, cs::IFramePtr frame_rgb)
+  static void rgb_frame_callback(cs::IFramePtr frame, void * user_data)
   {
-    // 1. Update internal health monitoring first
+    auto * self = static_cast<RevopointCameraNode *>(user_data);
+    if (self)
+    {
+      try
+      {
+        self->handle_rgb_frame(frame);
+      }
+      catch (const std::exception & e)
+      {
+        RCLCPP_ERROR(self->get_logger(), "Exception in RGB callback: %s", e.what());
+        self->error_count_.fetch_add(1);
+      }
+      catch (...)
+      {
+        RCLCPP_ERROR(self->get_logger(), "Unknown exception in RGB callback");
+        self->error_count_.fetch_add(1);
+      }
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // RGB handler — runs at native RGB rate (e.g. 20 Hz)
+  // Lightweight: just caches frame and signals publisher thread.
+  // ---------------------------------------------------------------------------
+
+  void handle_rgb_frame(cs::IFramePtr frame_rgb)
+  {
+    if (!frame_rgb || frame_rgb->empty()) {
+      return;
+    }
+
+    // Update watchdog (either stream proves the camera is alive)
+    update_watchdog();
+
+    // Cache the latest RGB frame for pointcloud colorization
+    if (publish_pointcloud_ && align_depth_)
+    {
+      std::lock_guard<std::mutex> lock(rgb_cache_mutex_);
+      cached_rgb_frame_ = frame_rgb;
+    }
+
+    // Queue frame for publishing on dedicated thread (returns immediately
+    // so the SDK callback thread is not blocked by ROS serialization/transport)
+    {
+      std::lock_guard<std::mutex> lock(rgb_pub_mutex_);
+      pending_rgb_frame_ = frame_rgb;
+    }
+    rgb_pub_cv_.notify_one();
+  }
+
+  // ---------------------------------------------------------------------------
+  // Depth handler — runs at native depth rate (e.g. 6 Hz)
+  // Lightweight: just caches frame and signals publisher thread.
+  // ---------------------------------------------------------------------------
+
+  void handle_depth_frame(cs::IFramePtr frame_dep)
+  {
+    if (!frame_dep || frame_dep->empty()) {
+      return;
+    }
+
+    // Update watchdog
+    update_watchdog();
+
+    // Queue frame for publishing on dedicated thread
+    {
+      std::lock_guard<std::mutex> lock(depth_pub_mutex_);
+      pending_depth_frame_ = frame_dep;
+    }
+    depth_pub_cv_.notify_one();
+  }
+
+  void update_watchdog()
+  {
     auto now_system = std::chrono::steady_clock::now();
     int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
       now_system.time_since_epoch()).count();
     last_frame_time_ns_.store(now_ns);
     frame_count_.fetch_add(1);
+  }
 
-    // 2. Generate a SINGLE timestamp for all messages in this cycle
-    rclcpp::Time stamp = this->get_clock()->now();
+  // ---------------------------------------------------------------------------
+  // Publisher threads — run processing + ROS publishing off the SDK callback
+  // thread so frame delivery is never blocked by DDS serialization/transport.
+  // ---------------------------------------------------------------------------
 
-    // --- OPTIMIZATION: PUBLISH RGB FIRST FOR MOVEIT ---
-    // MoveIt's Hand-Eye plugin subscribes to the RGB stream. By publishing this 
-    // immediately, we ensure the Image and CameraInfo arrive at Rviz with minimal 
-    // delay, preventing the 'Synchronizer' from dropping the pair.
-    if (frame_rgb && !frame_rgb->empty())
-    {
-      sensor_msgs::msg::Image rgb_msg;
-      rgb_msg.header.stamp = stamp;
-      rgb_msg.header.frame_id = rgb_frame_id_;
-      rgb_msg.height = frame_rgb->getHeight();
-      rgb_msg.width = frame_rgb->getWidth();
-      rgb_msg.encoding = sensor_msgs::image_encodings::RGB8;
-      rgb_msg.step = static_cast<uint32_t>(rgb_msg.width * 3);
-      
-      size_t rgb_size = rgb_msg.step * rgb_msg.height;
-      rgb_msg.data.resize(rgb_size);
-      const char * rgb_data = frame_rgb->getData();
-      if (rgb_data) {
-        std::memcpy(rgb_msg.data.data(), rgb_data, rgb_size);
-        
-        // Prepare Info
-        sensor_msgs::msg::CameraInfo rgb_info = rgb_info_msg_;
-        rgb_info.header.stamp = stamp;
-        
-        // Ensure Distortion vector is not empty (MoveIt requirement)
-        if (rgb_info.d.empty()) {
-            rgb_info.d = {0.0, 0.0, 0.0, 0.0, 0.0};
-        }
+  void start_publisher_threads()
+  {
+    running_.store(true);
+    rgb_pub_thread_ = std::thread([this]{ rgb_publisher_loop(); });
+    depth_pub_thread_ = std::thread([this]{ depth_publisher_loop(); });
+  }
 
-        // Publish as a tight pair
-        rgb_pub_->publish(rgb_msg);
-        rgb_info_pub_->publish(rgb_info);
+  void stop_publisher_threads()
+  {
+    running_.store(false);
+    rgb_pub_cv_.notify_all();
+    depth_pub_cv_.notify_all();
+    if (rgb_pub_thread_.joinable()) rgb_pub_thread_.join();
+    if (depth_pub_thread_.joinable()) depth_pub_thread_.join();
+  }
+
+  void rgb_publisher_loop()
+  {
+    while (running_.load()) {
+      cs::IFramePtr frame;
+      {
+        std::unique_lock<std::mutex> lock(rgb_pub_mutex_);
+        rgb_pub_cv_.wait(lock, [this]{ return pending_rgb_frame_ != nullptr || !running_.load(); });
+        if (!running_.load()) break;
+        frame = std::move(pending_rgb_frame_);
+        pending_rgb_frame_.reset();
+      }
+      if (!frame) continue;
+      try {
+        process_and_publish_rgb(frame);
+      } catch (const std::exception & e) {
+        RCLCPP_ERROR(get_logger(), "Exception in RGB publisher: %s", e.what());
+        error_count_.fetch_add(1);
       }
     }
+  }
 
-    // --- DEPTH PROCESSING ---
-    if (!frame_dep || frame_dep->empty()) {
+  void depth_publisher_loop()
+  {
+    while (running_.load()) {
+      cs::IFramePtr frame;
+      {
+        std::unique_lock<std::mutex> lock(depth_pub_mutex_);
+        depth_pub_cv_.wait(lock, [this]{ return pending_depth_frame_ != nullptr || !running_.load(); });
+        if (!running_.load()) break;
+        frame = std::move(pending_depth_frame_);
+        pending_depth_frame_.reset();
+      }
+      if (!frame) continue;
+      try {
+        process_and_publish_depth(frame);
+      } catch (const std::exception & e) {
+        RCLCPP_ERROR(get_logger(), "Exception in depth publisher: %s", e.what());
+        error_count_.fetch_add(1);
+      }
+    }
+  }
+
+  void process_and_publish_rgb(cs::IFramePtr frame_rgb)
+  {
+    rclcpp::Time stamp = this->get_clock()->now();
+
+    sensor_msgs::msg::Image rgb_msg;
+    rgb_msg.header.stamp = stamp;
+    rgb_msg.header.frame_id = rgb_frame_id_;
+    rgb_msg.height = frame_rgb->getHeight();
+    rgb_msg.width = frame_rgb->getWidth();
+    rgb_msg.encoding = sensor_msgs::image_encodings::RGB8;
+    rgb_msg.step = static_cast<uint32_t>(rgb_msg.width * 3);
+
+    size_t rgb_size = rgb_msg.step * rgb_msg.height;
+    rgb_msg.data.resize(rgb_size);
+    const char * rgb_data = frame_rgb->getData();
+    if (!rgb_data) {
       return;
     }
+    std::memcpy(rgb_msg.data.data(), rgb_data, rgb_size);
+
+    // Prepare CameraInfo
+    sensor_msgs::msg::CameraInfo rgb_info = rgb_info_msg_;
+    rgb_info.header.stamp = stamp;
+
+    // Ensure distortion vector is not empty (MoveIt requirement)
+    if (rgb_info.d.empty()) {
+      rgb_info.d = {0.0, 0.0, 0.0, 0.0, 0.0};
+    }
+
+    rgb_pub_->publish(rgb_msg);
+    rgb_info_pub_->publish(rgb_info);
+  }
+
+  void process_and_publish_depth(cs::IFramePtr frame_dep)
+  {
+    rclcpp::Time stamp = this->get_clock()->now();
 
     sensor_msgs::msg::Image depth_msg;
     depth_msg.header.stamp = stamp;
@@ -1315,36 +1387,45 @@ private:
     depth_msg.width = frame_dep->getWidth();
     depth_msg.encoding = sensor_msgs::image_encodings::TYPE_16UC1;
     depth_msg.step = static_cast<uint32_t>(depth_msg.width * sizeof(uint16_t));
-    
+
     size_t depth_size = depth_msg.step * depth_msg.height;
     depth_msg.data.resize(depth_size);
     const char * depth_data = frame_dep->getData(FRAME_DATA_FORMAT_Z16);
-    
-    if (depth_data) {
-      std::memcpy(depth_msg.data.data(), depth_data, depth_size);
 
-      // Prepare Depth Info
-      sensor_msgs::msg::CameraInfo depth_info = depth_info_msg_;
-      depth_info.header.stamp = stamp;
+    if (!depth_data) {
+      return;
+    }
+    std::memcpy(depth_msg.data.data(), depth_data, depth_size);
 
-      // 3. Heavy logic (Pointcloud and Scaling) happens AFTER RGB is already on the wire
-      if (publish_pointcloud_ && cloud_pub_) {
-        publish_pointcloud(depth_msg, align_depth_ ? frame_rgb : nullptr);
+    // Prepare Depth CameraInfo
+    sensor_msgs::msg::CameraInfo depth_info = depth_info_msg_;
+    depth_info.header.stamp = stamp;
+
+    // Generate pointcloud (uses cached RGB frame if align_depth is on)
+    if (publish_pointcloud_ && cloud_pub_) {
+      cs::IFramePtr rgb_for_pc;
+      if (align_depth_) {
+        std::lock_guard<std::mutex> lock(rgb_cache_mutex_);
+        rgb_for_pc = cached_rgb_frame_;  // may be null if no RGB yet
       }
+      publish_pointcloud(depth_msg, rgb_for_pc);
+    }
 
-      if (depth_scale_sdk_ != 1.0f) {
-        uint16_t * dst = reinterpret_cast<uint16_t *>(depth_msg.data.data());
-        float scale_factor = depth_scale_sdk_;
-        for (size_t i = 0; i < depth_msg.width * depth_msg.height; ++i) {
-          if (dst[i] != 0) {
-            float depth_mm = dst[i] * scale_factor;
-            dst[i] = static_cast<uint16_t>(std::min(depth_mm, 65535.0f));
-          }
+    // Apply depth scale conversion to mm
+    if (depth_scale_sdk_ != 1.0f) {
+      uint16_t * dst = reinterpret_cast<uint16_t *>(depth_msg.data.data());
+      const float scale_factor = depth_scale_sdk_;
+      const size_t num_pixels = depth_msg.width * depth_msg.height;
+      for (size_t i = 0; i < num_pixels; ++i) {
+        if (dst[i] != 0) {
+          float depth_mm = dst[i] * scale_factor;
+          dst[i] = static_cast<uint16_t>(std::min(depth_mm, 65535.0f));
         }
       }
+    }
 
-      depth_pub_->publish(depth_msg);
-      depth_info_pub_->publish(depth_info);
+    depth_pub_->publish(depth_msg);
+    depth_info_pub_->publish(depth_info);
 
     // Publish colorized depth visualization if enabled
     if (publish_depth_viz_ && depth_viz_pub_)
@@ -1378,9 +1459,9 @@ private:
           viz_ptr[i * 3 + 1] = 0;
           viz_ptr[i * 3 + 2] = 0;
         } else {
-          float normalized = (max_val > min_val) ? 
+          float normalized = (max_val > min_val) ?
             static_cast<float>(val - min_val) / (max_val - min_val) : 0.0f;
-          
+
           // Simple jet colormap
           float r, g, b;
           if (normalized < 0.25f) {
@@ -1400,7 +1481,7 @@ private:
             g = 1.0f - (normalized - 0.75f) * 4.0f;
             b = 0.0f;
           }
-          
+
           viz_ptr[i * 3 + 0] = static_cast<uint8_t>(r * 255);
           viz_ptr[i * 3 + 1] = static_cast<uint8_t>(g * 255);
           viz_ptr[i * 3 + 2] = static_cast<uint8_t>(b * 255);
@@ -1408,7 +1489,6 @@ private:
       }
 
       depth_viz_pub_->publish(depth_viz_msg);
-      }
     }
   }
 
@@ -1520,12 +1600,8 @@ private:
   double depth_frame_time_us_ = 0.0;
   double depth_gain_ = 0.0;
   int trigger_mode_ = 0;
-  int depth_rgb_match_threshold_ = 0;
-  int depth_rgb_match_rgb_offset_ = 0;
-  bool depth_rgb_match_force_rgb_after_depth_ = false;
 
   bool initial_reset_ = false;
-  bool clear_frame_buffer_ = false;
 
   bool laser_enable_ = true;
   int laser_luminance_ = 100;
@@ -1578,6 +1654,10 @@ private:
   Extrinsics extrinsics_{};
   bool has_extrinsics_ = false;
 
+  // RGB frame cache for pointcloud colorization (written by RGB callback, read by depth callback)
+  std::mutex rgb_cache_mutex_;
+  cs::IFramePtr cached_rgb_frame_;
+
   CameraInfo last_camera_info_{};
   bool has_camera_info_ = false;
 
@@ -1589,6 +1669,19 @@ private:
   double frame_timeout_seconds_ = 5.0;
   double half_timeout_seconds_ = 2.5;  // Pre-computed for efficiency
   bool enable_watchdog_ = true;
+
+  // Publisher threads — decouple SDK callbacks from ROS publishing
+  std::atomic<bool> running_{false};
+
+  std::mutex rgb_pub_mutex_;
+  std::condition_variable rgb_pub_cv_;
+  cs::IFramePtr pending_rgb_frame_;
+  std::thread rgb_pub_thread_;
+
+  std::mutex depth_pub_mutex_;
+  std::condition_variable depth_pub_cv_;
+  cs::IFramePtr pending_depth_frame_;
+  std::thread depth_pub_thread_;
 };
 
 }  // namespace revopoint_camera

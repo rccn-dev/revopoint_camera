@@ -20,11 +20,7 @@ def generate_launch_description():
         "depth_frame_time_us": 7500.0,
         "depth_gain": 1.0,
         "trigger_mode": 0,
-        "depth_rgb_match_threshold": 0,
-        "depth_rgb_match_rgb_offset": 0,
-        "depth_rgb_match_force_rgb_after_depth": False,
         "initial_reset": False,
-        "clear_frame_buffer": False,
         "laser_enable": True,
         "laser_luminance": 100,
         "ir_led_enable": False,
@@ -36,7 +32,7 @@ def generate_launch_description():
         "publish_pointcloud": True,
         "align_depth": True,
         "publish_depth_viz": False,
-        "qos_profile": "reliable",
+        "qos_profile": "sensor_data",
         "enable_watchdog": True,
         "frame_timeout_seconds": 5.0,
     }
@@ -46,19 +42,22 @@ def generate_launch_description():
     align_depth = LaunchConfiguration("align_depth")
     publish_depth_viz = LaunchConfiguration("publish_depth_viz")
     qos_profile = LaunchConfiguration("qos_profile")
+    initial_reset = LaunchConfiguration("initial_reset")
 
     # Update params with launch configuration
     params["publish_pointcloud"] = publish_pointcloud
     params["align_depth"] = align_depth
     params["publish_depth_viz"] = publish_depth_viz
     params["qos_profile"] = qos_profile
+    params["initial_reset"] = initial_reset
 
     return launch.LaunchDescription([
         DeclareLaunchArgument("namespace", default_value="camera"),
         DeclareLaunchArgument("publish_pointcloud", default_value="true"),
         DeclareLaunchArgument("align_depth", default_value="true"),
         DeclareLaunchArgument("publish_depth_viz", default_value="false"),
-        DeclareLaunchArgument("qos_profile", default_value="reliable"),
+        DeclareLaunchArgument("qos_profile", default_value="sensor_data"),
+        DeclareLaunchArgument("initial_reset", default_value="false"),
         launch_ros.actions.Node(
             package="revopoint_camera",
             executable="revopoint_camera_node",
