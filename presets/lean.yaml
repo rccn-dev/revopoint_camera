@@ -1,0 +1,11 @@
+# lean — minimum bandwidth. Depth image only, no cloud, no visualisation.
+# Useful on a constrained link or when another node builds the cloud.
+/**:
+  ros__parameters:
+    depth_profile: "800x600x12"
+    publish_pointcloud: false
+    publish_depth_viz: false
+    align_depth: false
+    qos_profile: "sensor_data"
+    qos_depth: 1
+    lazy_publish: true

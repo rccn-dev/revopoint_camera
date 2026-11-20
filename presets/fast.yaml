@@ -1,0 +1,25 @@
+# fast — maximise frame rate.
+#
+# 800x600 is the device's 12 Hz depth mode; 1600x1200 is capped at 6 Hz in
+# hardware, so this profile is the single biggest FPS lever available.
+/**:
+  ros__parameters:
+    depth_profile: "800x600x12"
+    rgb_profile: ""
+
+    publish_pointcloud: true
+    align_depth: true
+    publish_depth_viz: false
+
+    # Best effort with the shallowest useful queue: drop frames rather than
+    # block on a multi-megabyte message.
+    qos_profile: "sensor_data"
+    qos_depth: 1
+
+    lazy_publish: true
+    pointcloud_async: true
+
+    # Short exposure keeps the sensor's own frame time from becoming the limit.
+    depth_auto_exposure: false
+    depth_exposure_us: 3000.0
+    depth_frame_time_us: 7500.0

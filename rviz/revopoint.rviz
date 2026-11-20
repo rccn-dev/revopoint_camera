@@ -1,0 +1,94 @@
+Panels:
+  - Class: rviz_common/Displays
+    Name: Displays
+    Property Tree Widget:
+      Expanded:
+        - /PointCloud2
+      SplitterRatio: 0.5
+    Tree Height: 640
+Visualization Manager:
+  Class: ""
+  Displays:
+    - Class: rviz_default_plugins/Grid
+      Name: Grid
+      Enabled: true
+      Cell Size: 0.25
+      Plane Cell Count: 20
+      Color: 160; 160; 164
+      Reference Frame: <Fixed Frame>
+    - Class: rviz_default_plugins/TF
+      Name: TF
+      Enabled: true
+      Marker Scale: 0.2
+      Show Names: true
+      Show Axes: true
+      Show Arrows: false
+    - Class: rviz_default_plugins/PointCloud2
+      Name: PointCloud2
+      Enabled: true
+      Topic:
+        Value: /camera/points
+        Depth: 2
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Best Effort
+      Style: Points
+      Size (Pixels): 2
+      Alpha: 1
+      Color Transformer: RGB8
+      Decay Time: 0
+      Position Transformer: XYZ
+      Queue Size: 2
+      Use Fixed Frame: true
+    - Class: rviz_default_plugins/Image
+      Name: RGB
+      Enabled: true
+      Topic:
+        Value: /camera/rgb/image_raw
+        Depth: 2
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Best Effort
+      Max Value: 1
+      Min Value: 0
+      Normalize Range: true
+    - Class: rviz_default_plugins/Image
+      Name: Depth
+      Enabled: false
+      Topic:
+        Value: /camera/depth/image_raw
+        Depth: 2
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Best Effort
+      Max Value: 3000
+      Min Value: 0
+      Normalize Range: false
+  Enabled: true
+  Global Options:
+    Background Color: 48; 48; 48
+    Fixed Frame: revo_depth_optical_frame
+    Frame Rate: 30
+  Tools:
+    - Class: rviz_default_plugins/MoveCamera
+    - Class: rviz_default_plugins/Select
+    - Class: rviz_default_plugins/FocusCamera
+  Value: true
+  Views:
+    Current:
+      Class: rviz_default_plugins/Orbit
+      Name: Current View
+      Distance: 1.5
+      Pitch: 0.35
+      Yaw: 3.14
+      Focal Point:
+        X: 0
+        Y: 0
+        Z: 0.6
+      Target Frame: <Fixed Frame>
+    Saved: ~
+Window Geometry:
+  Height: 900
+  Width: 1400
+  Displays:
+    collapsed: false
