@@ -1,0 +1,22 @@
+# moveit_handeye — RGB + camera_info for MoveIt's hand-eye calibration plugin.
+#
+# The plugin only consumes the RGB image and its camera_info, so the point
+# cloud is turned off entirely; with lazy_publish that removes the depth work
+# from the pipeline as well.
+/**:
+  ros__parameters:
+    publish_pointcloud: false
+    publish_depth_viz: false
+    align_depth: false
+
+    # Calibration captures a handful of still frames, where a dropped message
+    # costs more than the latency reliable QoS adds.
+    qos_profile: "reliable"
+    qos_depth: 5
+
+    lazy_publish: true
+
+    rgb_auto_exposure: 1
+    rgb_auto_white_balance: 1
+
+    publish_extrinsics_tf: true

@@ -1,0 +1,5 @@
+# Default preset: change nothing beyond the node's own defaults.
+# Loaded when no `preset:=` argument is given.
+/**:
+  ros__parameters:
+    publish_diagnostics: true

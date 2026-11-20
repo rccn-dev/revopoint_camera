@@ -1,0 +1,174 @@
+#!/usr/bin/env bash
+# revo — QoL helper for testing and driving the Revopoint camera node.
+#
+#   revo <command> [args]
+#
+# Set REVO_NS to change the namespace (default: camera).
+set -euo pipefail
+
+NS="${REVO_NS:-camera}"
+NODE="/${NS}/revopoint_camera"
+PKG=revopoint_camera
+
+TOPICS=(
+  "/${NS}/depth/image_raw"
+  "/${NS}/rgb/image_raw"
+  "/${NS}/depth/camera_info"
+  "/${NS}/rgb/camera_info"
+  "/${NS}/points"
+)
+
+die() { echo "error: $*" >&2; exit 1; }
+have_node() {
+  ros2 node list 2>/dev/null | grep -qx "$NODE" || \
+    die "node $NODE not found. Is the driver running? (try: revo run)"
+}
+
+usage() {
+  cat <<EOF
+revo — Revopoint camera helper   (namespace: ${NS}, override with REVO_NS)
+
+Running the driver
+  run [preset] [args...]   Launch the driver (default preset: default)
+  fast                     Launch with preset:=fast    (800x600x12, ~12 Hz)
+  quality                  Launch with preset:=quality (1600x1200x6, HDR)
+  handeye                  Launch with preset:=moveit_handeye
+  rviz                     Open RViz with the bundled config
+
+Inspecting
+  topics                   List this camera's topics with their QoS
+  rates [sec]              Measure publish rate of every topic (default 5 s)
+  bench [sec]              Frame rate + bandwidth summary (default 10 s)
+  diag                     Show the latest diagnostics (FPS, temps, drops)
+  watch                    Live-refresh diagnostics once a second
+  params                   Dump the node's current parameters
+  caps                     Report which optional SDK features this unit accepted
+
+Controlling
+  pause | resume           Pause / resume the depth stream
+  trigger                  Send one software trigger (needs trigger_mode:=2)
+  reset-stats              Zero the frame / error / drop counters
+  set <param> <value>      Set a parameter at runtime
+
+  record [sec] [out]       Record a bag of all camera topics (default 10 s)
+EOF
+}
+
+cmd_rates() {
+  local secs="${1:-5}"
+  echo "Measuring for ${secs}s ..."
+  for t in "${TOPICS[@]}"; do
+    if ros2 topic list 2>/dev/null | grep -qx "$t"; then
+      local hz
+      hz=$(timeout "$((secs + 3))" ros2 topic hz "$t" --window 50 2>/dev/null \
+           | grep -m1 "average rate" | awk '{print $3}' || true)
+      printf "  %-34s %s Hz\n" "$t" "${hz:-no data}"
+    else
+      printf "  %-34s (not advertised)\n" "$t"
+    fi
+  done
+}
+
+cmd_bench() {
+  local secs="${1:-10}"
+  have_node
+  echo "Benchmarking for ${secs}s ..."
+  echo
+  ros2 service call "${NODE}/reset_stats" std_srvs/srv/Trigger >/dev/null 2>&1 || true
+  sleep "$secs"
+  cmd_diag
+  echo
+  echo "Bandwidth:"
+  for t in "/${NS}/points" "/${NS}/rgb/image_raw" "/${NS}/depth/image_raw"; do
+    if ros2 topic list 2>/dev/null | grep -qx "$t"; then
+      local bw
+      bw=$(timeout 8 ros2 topic bw "$t" 2>/dev/null | grep -m1 "average:" || true)
+      printf "  %-34s %s\n" "$t" "${bw:-no data}"
+    fi
+  done
+}
+
+cmd_diag() {
+  local out
+  out=$(timeout 8 ros2 topic echo /diagnostics --once 2>/dev/null || true)
+  [ -n "$out" ] || die "no /diagnostics message. Is publish_diagnostics enabled and the node running?"
+  # `ros2 topic echo` renders the level byte as \x00..\x03; map it to a name.
+  echo "$out" | awk '
+    /^[[:space:]]*message:/ { sub(/^[[:space:]]*message:[[:space:]]*/,""); gsub(/^"|"$/,""); status=$0 }
+    /^[[:space:]]*-?[[:space:]]*level:/ {
+      raw=$0; sub(/^.*level:[[:space:]]*/,"",raw); gsub(/["\\]/,"",raw)
+      if (raw ~ /3$/)      lvl="STALE"
+      else if (raw ~ /2$/) lvl="ERROR"
+      else if (raw ~ /1$/) lvl="WARN"
+      else                 lvl="OK"
+    }
+    /key:/ { k=$NF; getline; sub(/^[[:space:]]*value:[[:space:]]*/,""); gsub(/'"'"'|"/,""); printf "  %-26s %s\n", k, $0 }
+    END { if (status != "") printf "\nstatus: %s [%s]\n", status, lvl }
+  '
+}
+
+cmd_watch() {
+  while true; do
+    clear
+    echo "=== ${NODE} diagnostics — $(date '+%H:%M:%S') (Ctrl-C to stop) ==="
+    cmd_diag || true
+    sleep 1
+  done
+}
+
+cmd_caps() {
+  have_node
+  echo "Optional SDK features this unit accepted (from the node's startup log)."
+  echo "A 'Failed to set ...' line means the model does not support that property."
+  echo
+  ros2 param list "$NODE" 2>/dev/null | sed 's/^/  /' | grep -E \
+    "hdr|roi|filter|fusion|fast_scan|hardware_sync|trigger|indicator|rgb_(auto|exposure|gain|white|focus)|max_" \
+    || echo "  (none of the optional parameters are declared)"
+}
+
+cmd_topics() {
+  for t in "${TOPICS[@]}"; do
+    if ros2 topic list 2>/dev/null | grep -qx "$t"; then
+      echo "$t"
+      ros2 topic info -v "$t" 2>/dev/null \
+        | grep -E "Reliability|Durability|History" | sed 's/^/    /' | head -3
+    fi
+  done
+}
+
+call_trigger() {
+  have_node
+  ros2 service call "${NODE}/$1" std_srvs/srv/Trigger
+}
+
+cmd_record() {
+  local secs="${1:-10}" out="${2:-revo_$(date +%Y%m%d_%H%M%S)}"
+  echo "Recording ${secs}s to ${out} ..."
+  timeout "$secs" ros2 bag record -o "$out" "${TOPICS[@]}" /diagnostics /tf_static || true
+  echo "Wrote ${out}"
+}
+
+case "${1:-help}" in
+  run)      shift; p="${1:-default}"; [ $# -gt 0 ] && shift || true
+            exec ros2 launch "$PKG" revo_launch.py "preset:=$p" "$@" ;;
+  fast)     shift; exec ros2 launch "$PKG" revo_launch.py preset:=fast "$@" ;;
+  quality)  shift; exec ros2 launch "$PKG" revo_launch.py preset:=quality "$@" ;;
+  handeye)  shift; exec ros2 launch "$PKG" revo_launch.py preset:=moveit_handeye "$@" ;;
+  rviz)     exec rviz2 -d "$(ros2 pkg prefix $PKG)/share/$PKG/rviz/revopoint.rviz" ;;
+  topics)   cmd_topics ;;
+  rates)    shift; cmd_rates "$@" ;;
+  bench)    shift; cmd_bench "$@" ;;
+  diag)     cmd_diag ;;
+  watch)    cmd_watch ;;
+  params)   have_node; ros2 param dump "$NODE" ;;
+  caps)     cmd_caps ;;
+  pause)    call_trigger pause_stream ;;
+  resume)   call_trigger resume_stream ;;
+  trigger)  call_trigger soft_trigger ;;
+  reset-stats) call_trigger reset_stats ;;
+  set)      shift; [ $# -eq 2 ] || die "usage: revo set <param> <value>"
+            have_node; ros2 param set "$NODE" "$1" "$2" ;;
+  record)   shift; cmd_record "$@" ;;
+  help|-h|--help) usage ;;
+  *)        usage; exit 1 ;;
+esac

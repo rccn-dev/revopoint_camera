@@ -1,0 +1,28 @@
+# quality — best depth at the device's full resolution. Expect 6 Hz.
+/**:
+  ros__parameters:
+    depth_profile: "1600x1200x6"
+
+    publish_pointcloud: true
+    align_depth: true
+    publish_depth_viz: true
+
+    qos_profile: "sensor_data"
+    qos_depth: 2
+    lazy_publish: true
+    pointcloud_async: true
+
+    # HDR helps on scenes mixing bright and dark/shiny surfaces.
+    hdr_mode: "all_reflect"
+    # Dual-exposure fusion; costs frame rate, improves completeness.
+    multiframe_fusion: 1
+
+    depth_auto_exposure: false
+    depth_exposure_us: 5000.0
+    depth_frame_time_us: 12000.0
+
+    laser_enable: true
+    laser_luminance: 100
+
+    # depth_filter_level: <int>   # valid range is model dependent; check
+    #                             # `revo caps` output before setting this.

@@ -1,5 +1,8 @@
+#include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <limits>
 #include <cmath>
 #include <cstring>
 #include <memory>
@@ -18,6 +21,8 @@
 #include "sensor_msgs/distortion_models.hpp"
 #include "sensor_msgs/point_cloud2_iterator.hpp"
 #include "camera_info_manager/camera_info_manager.hpp"
+#include "diagnostic_msgs/msg/diagnostic_array.hpp"
+#include "std_srvs/srv/trigger.hpp"
 #include "tf2/LinearMath/Matrix3x3.h"
 #include "tf2/LinearMath/Quaternion.h"
 #include "tf2_ros/static_transform_broadcaster.h"
@@ -34,8 +39,8 @@ namespace revopoint_camera
 class RevopointCameraNode : public rclcpp::Node
 {
 public:
-  RevopointCameraNode()
-  : Node("revopoint_camera")
+  explicit RevopointCameraNode(const rclcpp::NodeOptions & options)
+  : Node("revopoint_camera", options)
   {
     serial_ = declare_parameter<std::string>("serial", "");
 
@@ -76,10 +81,44 @@ public:
     depth_range_max_mm_ = declare_parameter<int>("depth_range_max_mm", 0);
     algorithm_contrast_ = declare_parameter<int>("algorithm_contrast", 0);
 
+    // --- Additional SDK capabilities -------------------------------------
+    // Tri-state ints: -1 leaves the device default untouched, 0 = off, 1 = on.
+    // Every one of these is opt-in, so an unset parameter never issues a
+    // property write and behaviour is unchanged from before they existed.
+    hdr_mode_ = declare_parameter<std::string>("hdr_mode", "");
+    hdr_scale_ = declare_parameter<std::vector<int64_t>>(
+      "hdr_scale", std::vector<int64_t>{});
+    depth_filter_level_ = declare_parameter<int>("depth_filter_level", -1);
+    depth_roi_ = declare_parameter<std::vector<int64_t>>(
+      "depth_roi", std::vector<int64_t>{});
+    rgb_roi_ = declare_parameter<std::vector<int64_t>>(
+      "rgb_roi", std::vector<int64_t>{});
+    multiframe_fusion_ = declare_parameter<int>("multiframe_fusion", -1);
+    fast_scan_mode_ = declare_parameter<int>("fast_scan_mode", -1);
+    hardware_sync_ = declare_parameter<int>("hardware_sync", -1);
+    trigger_out_enable_ = declare_parameter<int>("trigger_out_enable", -1);
+    trigger_in_mode_ = declare_parameter<int>("trigger_in_mode", -1);
+    indicator_light_mode_ = declare_parameter<std::string>("indicator_light_mode", "");
+    max_frame_time_us_ = declare_parameter<double>("max_frame_time_us", -1.0);
+    max_gain_ = declare_parameter<double>("max_gain", -1.0);
+
+    rgb_exposure_us_ = declare_parameter<double>("rgb_exposure_us", -1.0);
+    rgb_auto_exposure_ = declare_parameter<int>("rgb_auto_exposure", -1);
+    rgb_auto_white_balance_ = declare_parameter<int>("rgb_auto_white_balance", -1);
+    rgb_white_balance_ = declare_parameter<double>("rgb_white_balance", -1.0);
+    rgb_gain_ = declare_parameter<double>("rgb_gain", -1.0);
+    rgb_auto_focus_ = declare_parameter<int>("rgb_auto_focus", -1);
+    rgb_focus_ = declare_parameter<double>("rgb_focus", -1.0);
+
+    publish_diagnostics_ = declare_parameter<bool>("publish_diagnostics", true);
+
     publish_pointcloud_ = declare_parameter<bool>("publish_pointcloud", false);
     align_depth_ = declare_parameter<bool>("align_depth", true);
     publish_depth_viz_ = declare_parameter<bool>("publish_depth_viz", false);
-    qos_profile_ = declare_parameter<std::string>("qos_profile", "reliable");
+    qos_profile_ = declare_parameter<std::string>("qos_profile", "sensor_data");
+    qos_depth_ = declare_parameter<int>("qos_depth", 2);
+    lazy_publish_ = declare_parameter<bool>("lazy_publish", true);
+    pointcloud_async_ = declare_parameter<bool>("pointcloud_async", true);
 
     depth_pub_ = create_publisher<sensor_msgs::msg::Image>("depth/image_raw", get_qos());
     rgb_pub_ = create_publisher<sensor_msgs::msg::Image>("rgb/image_raw", get_qos());
@@ -98,6 +137,13 @@ public:
     rgb_info_manager_ = std::make_shared<camera_info_manager::CameraInfoManager>(this, "rgb", rgb_info_url_);
 
     tf_broadcaster_ = std::make_shared<tf2_ros::StaticTransformBroadcaster>(this);
+
+    if (publish_diagnostics_)
+    {
+      diagnostics_pub_ = create_publisher<diagnostic_msgs::msg::DiagnosticArray>(
+        "/diagnostics", rclcpp::QoS(rclcpp::KeepLast(5)));
+    }
+    create_services();
 
     // Initialize frame monitoring
     frame_timeout_seconds_ = declare_parameter<double>("frame_timeout_seconds", 5.0);
@@ -136,10 +182,28 @@ public:
       watchdog_timer_->cancel();
       watchdog_timer_.reset();
     }
+    // Stop the camera first so the SDK thread can no longer enqueue work, then
+    // drain and join the point cloud worker.
     stop_camera();
+    stop_cloud_worker();
   }
 
 private:
+  /**
+   * @brief One staged frame pair awaiting point cloud construction.
+   *
+   * Buffers are reused across frames (assign() into existing capacity), so the
+   * steady-state hand-off between the SDK thread and the worker allocates nothing.
+   */
+  struct CloudJob
+  {
+    std::vector<uint16_t> depth;
+    std::vector<uint8_t> rgb;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    rclcpp::Time stamp;
+  };
+
   /**
    * @brief Get the configured QoS profile for publishers.
    * 
@@ -154,26 +218,26 @@ private:
    */
   rclcpp::QoS get_qos() const
   {
-    // // Parse QoS profile string and return appropriate QoS
-    // if (qos_profile_ == "reliable")
-    // {
-    //   // Reliable QoS with history depth of 10
-    //   return rclcpp::QoS(rclcpp::KeepLast(10)).reliable();
-    // }
-    // else if (qos_profile_ == "best_effort" || qos_profile_ == "sensor_data")
-    // {
-    //   // Best effort QoS (SensorDataQoS)
-    //   return rclcpp::SensorDataQoS();
-    // }
-    // else
-    // {
-    //   RCLCPP_WARN_ONCE(get_logger(), 
-    //     "Unknown QoS profile '%s', defaulting to 'reliable'. "
-    //     "Valid options are: 'reliable', 'best_effort', 'sensor_data'", 
-    //     qos_profile_.c_str());
-    //   return rclcpp::QoS(rclcpp::KeepLast(10)).reliable();
-    // }
-    return rclcpp::QoS(10).reliable().durability_volatile();
+    // Depth of 1-2 is what you want for a camera: a late subscriber should get the
+    // newest frame, not a backlog of stale multi-megabyte messages.
+    const int depth = std::max(1, qos_depth_);
+
+    if (qos_profile_ == "best_effort" || qos_profile_ == "sensor_data")
+    {
+      // Best effort: a dropped frame is cheaper than head-of-line blocking on a
+      // ~30 MB point cloud. This is the right default for high-rate sensor data.
+      return rclcpp::QoS(rclcpp::KeepLast(depth)).best_effort().durability_volatile();
+    }
+
+    if (qos_profile_ != "reliable")
+    {
+      RCLCPP_WARN_ONCE(get_logger(),
+        "Unknown QoS profile '%s', defaulting to 'reliable'. "
+        "Valid options are: 'sensor_data', 'best_effort', 'reliable'",
+        qos_profile_.c_str());
+    }
+
+    return rclcpp::QoS(rclcpp::KeepLast(depth)).reliable().durability_volatile();
   }
 
   bool hardware_reset(const CameraInfo * info)
@@ -398,6 +462,8 @@ private:
       configure_laser();
       configure_leds();
       configure_depth_controls();
+      configure_advanced();
+      configure_rgb_controls();
       update_camera_info();
 
       return true;
@@ -477,6 +543,8 @@ private:
     configure_laser();
     configure_leds();
     configure_depth_controls();
+    configure_advanced();
+    configure_rgb_controls();
     update_camera_info();
 
     return true;
@@ -484,6 +552,7 @@ private:
 
   void stop_camera()
   {
+    std::lock_guard<std::mutex> lock(camera_mutex_);
     if (camera_)
     {
       camera_->stopStream();
@@ -553,11 +622,155 @@ private:
 
   void initialize_rgb_parameters()
   {
-    // Pre-compute RGB frame dimensions and texture scale factors once at stream start
+    // Pre-compute RGB/depth frame dimensions once at stream start.
     rgb_width_ = rgb_stream_info_.width;
     rgb_height_ = rgb_stream_info_.height;
-    tex_scale_x_ = static_cast<float>(rgb_width_ - 1);
-    tex_scale_y_ = static_cast<float>(rgb_height_ - 1);
+    depth_width_ = depth_stream_info_.width;
+    depth_height_ = depth_stream_info_.height;
+  }
+
+  /**
+   * @brief Pre-compute every constant the point cloud kernel needs.
+   *
+   * Called after update_camera_info(), i.e. once intrinsics, extrinsics and the
+   * depth scale are known. Doing this here keeps the per-frame kernel free of
+   * divisions and of the intrinsics rescaling that cs::Pointcloud redoes on
+   * every single frame.
+   */
+  void initialize_projection_parameters()
+  {
+    // cs::Pointcloud rescales the depth intrinsics to the actual stream size on
+    // every frame; we do it once. Same for RGB, which the SDK did NOT do (it
+    // indexed the frame with intrinsics-resolution coordinates).
+    const float dsx = (depth_intrinsics_.width > 0)
+      ? static_cast<float>(depth_width_) / depth_intrinsics_.width : 1.0f;
+    const float dsy = (depth_intrinsics_.height > 0)
+      ? static_cast<float>(depth_height_) / depth_intrinsics_.height : 1.0f;
+
+    const float fx = depth_intrinsics_.fx * dsx;
+    const float fy = depth_intrinsics_.fy * dsy;
+    proj_cx_ = depth_intrinsics_.cx * dsx;
+    proj_cy_ = depth_intrinsics_.cy * dsy;
+    proj_inv_fx_ = (fx != 0.0f) ? 1.0f / fx : 0.0f;
+    proj_inv_fy_ = (fy != 0.0f) ? 1.0f / fy : 0.0f;
+
+    const float rsx = (rgb_intrinsics_.width > 0)
+      ? static_cast<float>(rgb_width_) / rgb_intrinsics_.width : 1.0f;
+    const float rsy = (rgb_intrinsics_.height > 0)
+      ? static_cast<float>(rgb_height_) / rgb_intrinsics_.height : 1.0f;
+    rgb_fx_ = rgb_intrinsics_.fx * rsx;
+    rgb_fy_ = rgb_intrinsics_.fy * rsy;
+    rgb_cx_ = rgb_intrinsics_.cx * rsx;
+    rgb_cy_ = rgb_intrinsics_.cy * rsy;
+
+    // Depth raw units -> millimetres (the SDK convention this kernel works in).
+    depth_unit_to_mm_ = depth_scale_sdk_;
+
+    // Raw depth unit -> millimetre lookup table for the published 16UC1 image.
+    // Replaces a float multiply + clamp + branch per pixel with one L2-resident
+    // table lookup (64 KB).
+    depth_mm_lut_identity_ = (std::abs(depth_scale_sdk_ - 1.0f) < 1e-6f);
+    if (!depth_mm_lut_identity_)
+    {
+      depth_mm_lut_.resize(65536);
+      depth_mm_lut_[0] = 0;
+      for (size_t i = 1; i < 65536; ++i)
+      {
+        const float mm = static_cast<float>(i) * depth_scale_sdk_;
+        depth_mm_lut_[i] = static_cast<uint16_t>(std::min(mm, 65535.0f));
+      }
+    }
+    else
+    {
+      depth_mm_lut_.clear();
+    }
+
+    // 256-entry jet colormap, so the visualisation is a table lookup per pixel
+    // instead of four branches and three float multiplies.
+    build_jet_lut();
+
+    RCLCPP_INFO(get_logger(),
+      "Point cloud kernel ready: depth %dx%d (fx=%.2f fy=%.2f cx=%.2f cy=%.2f), "
+      "rgb %dx%d (fx=%.2f fy=%.2f cx=%.2f cy=%.2f), %.6f mm/unit",
+      depth_width_, depth_height_, fx, fy, proj_cx_, proj_cy_,
+      rgb_width_, rgb_height_, rgb_fx_, rgb_fy_, rgb_cx_, rgb_cy_,
+      static_cast<double>(depth_scale_sdk_));
+  }
+
+  void build_jet_lut()
+  {
+    jet_lut_.resize(256 * 3);
+    for (int i = 0; i < 256; ++i)
+    {
+      const float n = static_cast<float>(i) / 255.0f;
+      float r, g, b;
+      if (n < 0.25f)      { r = 0.0f;              g = n * 4.0f;                b = 1.0f; }
+      else if (n < 0.5f)  { r = 0.0f;              g = 1.0f;                    b = 1.0f - (n - 0.25f) * 4.0f; }
+      else if (n < 0.75f) { r = (n - 0.5f) * 4.0f; g = 1.0f;                    b = 0.0f; }
+      else                { r = 1.0f;              g = 1.0f - (n - 0.75f) * 4.0f; b = 0.0f; }
+      jet_lut_[i * 3 + 0] = static_cast<uint8_t>(r * 255.0f);
+      jet_lut_[i * 3 + 1] = static_cast<uint8_t>(g * 255.0f);
+      jet_lut_[i * 3 + 2] = static_cast<uint8_t>(b * 255.0f);
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Point cloud worker thread
+  // ---------------------------------------------------------------------------
+
+  void start_cloud_worker()
+  {
+    if (!publish_pointcloud_ || !pointcloud_async_ || cloud_thread_.joinable())
+    {
+      return;
+    }
+    cloud_stop_ = false;
+    cloud_thread_ = std::thread([this]() { cloud_worker(); });
+    RCLCPP_INFO(get_logger(), "Point cloud worker thread started (latest-frame-wins)");
+  }
+
+  void stop_cloud_worker()
+  {
+    if (!cloud_thread_.joinable())
+    {
+      return;
+    }
+    {
+      std::lock_guard<std::mutex> lock(cloud_mutex_);
+      cloud_stop_ = true;
+    }
+    cloud_cv_.notify_all();
+    cloud_thread_.join();
+  }
+
+  void cloud_worker()
+  {
+    CloudJob job;
+    for (;;)
+    {
+      {
+        std::unique_lock<std::mutex> lock(cloud_mutex_);
+        cloud_cv_.wait(lock, [this]() { return cloud_job_pending_ || cloud_stop_; });
+        if (cloud_stop_)
+        {
+          return;
+        }
+        // Swap rather than copy: O(1), and it hands our now-unused buffers back
+        // to the producer so steady state does zero heap allocation.
+        std::swap(job, pending_job_);
+        cloud_job_pending_ = false;
+      }
+
+      try
+      {
+        build_and_publish_cloud(job);
+      }
+      catch (const std::exception & e)
+      {
+        RCLCPP_ERROR(get_logger(), "Exception in point cloud worker: %s", e.what());
+        error_count_.fetch_add(1, std::memory_order_relaxed);
+      }
+    }
   }
 
   bool start_streams()
@@ -1081,14 +1294,41 @@ private:
         RCLCPP_WARN(get_logger(), "Failed to get extrinsics");
       }
     }
+
+    // Depends on intrinsics, extrinsics and depth scale, so it must run last.
+    initialize_projection_parameters();
+    start_cloud_worker();
   }
 
   void check_stream_health()
   {
     auto now = std::chrono::steady_clock::now();
     int64_t last_frame_time_ns = last_frame_time_ns_.load();
-    
-    // Skip check if we haven't received any frames yet (during startup)
+
+    // Measured frame rate over the interval since the previous tick. This is
+    // counted in the SDK callback, so it is what the camera actually delivered.
+    double measured_fps = 0.0;
+    const uint64_t frames_now = frame_count_.load(std::memory_order_relaxed);
+    if (last_diag_time_.time_since_epoch().count() != 0)
+    {
+      const double dt = std::chrono::duration<double>(now - last_diag_time_).count();
+      if (dt > 0.0 && frames_now >= last_diag_frame_count_)
+      {
+        measured_fps = static_cast<double>(frames_now - last_diag_frame_count_) / dt;
+      }
+    }
+    last_diag_time_ = now;
+    last_diag_frame_count_ = frames_now;
+
+    const double since_frame = (last_frame_time_ns == 0)
+      ? 0.0
+      : std::chrono::duration<double>(
+          now - std::chrono::steady_clock::time_point(
+            std::chrono::steady_clock::duration(last_frame_time_ns))).count();
+
+    publish_diagnostics(measured_fps, since_frame);
+
+    // Skip the warning path if we haven't received any frames yet (startup).
     if (last_frame_time_ns == 0)
     {
       return;
@@ -1108,9 +1348,12 @@ private:
       // Log frame statistics
       auto total_frames = frame_count_.load();
       auto error_count = error_count_.load();
-      RCLCPP_ERROR(get_logger(), 
-        "Frame statistics - Total: %lu, Errors: %lu, Last frame: %ld seconds ago",
-        total_frames, error_count, elapsed);
+      RCLCPP_ERROR(get_logger(),
+        "Frame statistics - Total: %lu, Errors: %lu, Clouds dropped: %lu, "
+        "Last frame: %ld seconds ago",
+        total_frames, error_count,
+        static_cast<unsigned long>(cloud_dropped_.load(std::memory_order_relaxed)),
+        elapsed);
     }
     else if (static_cast<double>(elapsed) > half_timeout_seconds_)
     {
@@ -1234,273 +1477,873 @@ private:
     return cam_info;
   }
 
-  static void frame_pair_callback(cs::IFramePtr frame_dep, cs::IFramePtr frame_rgb, void * user_data)
+  // ===========================================================================
+  // Additional SDK capabilities
+  //
+  // Every setter here is opt-in and fails soft: an unsupported property logs a
+  // warning and startup continues, matching how the pre-existing configure_*
+  // methods behave. Not every Revopoint model implements every property.
+  // ===========================================================================
+
+  /// -1 means "leave the device default alone".
+  static bool is_set(int v) { return v >= 0; }
+  static bool is_set(double v) { return v >= 0.0; }
+
+  bool set_ext(PROPERTY_TYPE_EXTENSION prop, const PropertyExtension & value, const char * what)
   {
-    auto * self = static_cast<RevopointCameraNode *>(user_data);
-    if (self)
+    const ERROR_CODE ret = camera_->setPropertyExtension(prop, value);
+    if (ret != SUCCESS)
     {
-      try
+      RCLCPP_WARN(get_logger(),
+        "Failed to set %s (ret=%d) - this model may not support it", what, ret);
+      return false;
+    }
+    RCLCPP_INFO(get_logger(), "Set %s", what);
+    return true;
+  }
+
+  bool set_prop(STREAM_TYPE stream, PROPERTY_TYPE prop, float value, const char * what)
+  {
+    const ERROR_CODE ret = camera_->setProperty(stream, prop, value);
+    if (ret != SUCCESS)
+    {
+      RCLCPP_WARN(get_logger(),
+        "Failed to set %s = %.2f (ret=%d) - this model may not support it",
+        what, static_cast<double>(value), ret);
+      return false;
+    }
+    RCLCPP_INFO(get_logger(), "Set %s = %.2f", what, static_cast<double>(value));
+    return true;
+  }
+
+  /// Parse a 4-element [left, top, right, bottom] ROI given in percent (0-100).
+  bool parse_roi(const std::vector<int64_t> & in, int & l, int & t, int & r, int & b,
+    const char * what)
+  {
+    if (in.empty())
+    {
+      return false;
+    }
+    if (in.size() != 4)
+    {
+      RCLCPP_WARN(get_logger(),
+        "%s must have 4 elements [left, top, right, bottom] in percent, got %zu - ignoring",
+        what, in.size());
+      return false;
+    }
+    for (const auto v : in)
+    {
+      if (v < 0 || v > 100)
       {
-        self->handle_frame_pair(frame_dep, frame_rgb);
+        RCLCPP_WARN(get_logger(),
+          "%s values are percentages and must be 0-100, got %ld - ignoring", what,
+          static_cast<long>(v));
+        return false;
       }
-      catch (const std::exception & e)
+    }
+    l = static_cast<int>(in[0]); t = static_cast<int>(in[1]);
+    r = static_cast<int>(in[2]); b = static_cast<int>(in[3]);
+    if (l >= r || t >= b)
+    {
+      RCLCPP_WARN(get_logger(),
+        "%s is empty (left >= right or top >= bottom) - ignoring", what);
+      return false;
+    }
+    return true;
+  }
+
+  void configure_advanced()
+  {
+    // --- HDR ---------------------------------------------------------------
+    if (!hdr_mode_.empty())
+    {
+      HDR_MODE mode = HDR_MODE_OFF;
+      bool ok = true;
+      if (hdr_mode_ == "off") { mode = HDR_MODE_OFF; }
+      else if (hdr_mode_ == "high_reflect") { mode = HDR_MODE_HIGH_RELECT; }
+      else if (hdr_mode_ == "low_reflect") { mode = HDR_MODE_LOW_RELECT; }
+      else if (hdr_mode_ == "all_reflect") { mode = HDR_MODE_ALL_RELECT; }
+      else
       {
-        RCLCPP_ERROR(self->get_logger(), "Exception in frame callback: %s", e.what());
-        self->error_count_.fetch_add(1);
+        RCLCPP_WARN(get_logger(),
+          "Unknown hdr_mode '%s'. Valid: off, high_reflect, low_reflect, all_reflect",
+          hdr_mode_.c_str());
+        ok = false;
       }
-      catch (...)
+      if (ok)
       {
-        RCLCPP_ERROR(self->get_logger(), "Unknown exception in frame callback");
-        self->error_count_.fetch_add(1);
+        PropertyExtension p;
+        p.hdrMode = mode;
+        set_ext(PROPERTY_EXT_HDR_MODE, p, ("HDR mode '" + hdr_mode_ + "'").c_str());
+      }
+    }
+
+    // Auto-HDR tuning: [highReflectCount, highReflectScale, lowReflectCount, lowReflectScale]
+    if (!hdr_scale_.empty())
+    {
+      if (hdr_scale_.size() != 4)
+      {
+        RCLCPP_WARN(get_logger(),
+          "hdr_scale must have 4 elements [high_count, high_scale, low_count, low_scale], "
+          "got %zu - ignoring", hdr_scale_.size());
+      }
+      else
+      {
+        PropertyExtension p;
+        p.hdrScaleSetting.highReflectModeCount = static_cast<unsigned int>(hdr_scale_[0]);
+        p.hdrScaleSetting.highReflectModeScale = static_cast<unsigned int>(hdr_scale_[1]);
+        p.hdrScaleSetting.lowReflectModeCount = static_cast<unsigned int>(hdr_scale_[2]);
+        p.hdrScaleSetting.lowReflectModeScale = static_cast<unsigned int>(hdr_scale_[3]);
+        set_ext(PROPERTY_EXT_HDR_SCALE_SETTING, p, "HDR scale setting");
+      }
+    }
+
+    // --- Depth filtering ---------------------------------------------------
+    if (is_set(depth_filter_level_))
+    {
+      PropertyExtension p;
+      p.filterSwitch = depth_filter_level_;
+      set_ext(PROPERTY_EXT_FILTERING_SWITCH, p, "depth filter level");
+    }
+
+    // --- ROIs --------------------------------------------------------------
+    // A depth ROI is a real throughput lever: it reduces what the sensor
+    // produces, which shrinks every downstream stage including the point cloud.
+    int l, t, r, b;
+    if (parse_roi(depth_roi_, l, t, r, b, "depth_roi"))
+    {
+      PropertyExtension p;
+      p.depthRoi.left = l; p.depthRoi.top = t;
+      p.depthRoi.right = r; p.depthRoi.bottom = b;
+      set_ext(PROPERTY_EXT_DEPTH_ROI, p, "depth ROI");
+    }
+    if (parse_roi(rgb_roi_, l, t, r, b, "rgb_roi"))
+    {
+      PropertyExtension p;
+      p.rgbRoi.left = l; p.rgbRoi.top = t;
+      p.rgbRoi.right = r; p.rgbRoi.bottom = b;
+      set_ext(PROPERTY_EXT_RGB_ROI, p, "RGB ROI");
+    }
+
+    // --- Capture modes -----------------------------------------------------
+    if (is_set(multiframe_fusion_))
+    {
+      PropertyExtension p;
+      p.multiframeFusion = (multiframe_fusion_ != 0);
+      set_ext(PROPERTY_EXT_MULTIFRAME_FUSION, p, "multiframe fusion");
+    }
+    if (is_set(fast_scan_mode_))
+    {
+      PropertyExtension p;
+      p.bFastScanMode = (fast_scan_mode_ != 0);
+      set_ext(PROPERTY_EXT_FAST_SCAN_MODE, p, "fast scan mode");
+    }
+    if (is_set(hardware_sync_))
+    {
+      PropertyExtension p;
+      p.bHardSyncSwitch = (hardware_sync_ != 0);
+      set_ext(PROPERTY_EXT_HARDSYNCSWITCH, p, "hardware sync");
+    }
+    if (is_set(trigger_out_enable_))
+    {
+      PropertyExtension p;
+      p.triggerOutEnable = trigger_out_enable_;
+      set_ext(PROPERTY_EXT_TRIGGER_OUT_MODE, p, "trigger out");
+    }
+    if (is_set(trigger_in_mode_))
+    {
+      PropertyExtension p;
+      p.triggerInMode = static_cast<TRIGGER_MODE>(trigger_in_mode_);
+      set_ext(PROPERTY_EXT_TRIGGER_IN_MODE, p, "trigger in mode");
+    }
+
+    // --- Exposure/gain ceiling used by auto-exposure ------------------------
+    if (is_set(max_frame_time_us_) || is_set(max_gain_))
+    {
+      PropertyExtension p;
+      // Vendor-recommended values are 15000 (frame time) and 48 (gain).
+      p.maxFrameTimeGain.iMaxFrame =
+        is_set(max_frame_time_us_) ? static_cast<int>(max_frame_time_us_) : 15000;
+      p.maxFrameTimeGain.iMaxGain =
+        is_set(max_gain_) ? static_cast<int>(max_gain_) : 48;
+      set_ext(PRPOERTY_EXT_MAX_FRAMETIME_GAIN, p, "max frame time / gain");
+    }
+
+    // --- Indicator light ---------------------------------------------------
+    if (!indicator_light_mode_.empty())
+    {
+      INDICATOR_LIGHT_MODE mode = LIGHTING_OFF;
+      bool ok = true;
+      if (indicator_light_mode_ == "off") { mode = LIGHTING_OFF; }
+      else if (indicator_light_mode_ == "red") { mode = RED_LIGHT_CONSTANTLY_LIT; }
+      else if (indicator_light_mode_ == "red_flashing") { mode = RED_LIGHT_FLASHING; }
+      else if (indicator_light_mode_ == "green") { mode = GREEN_LIGHT_CONSTANTLY_LIT; }
+      else
+      {
+        RCLCPP_WARN(get_logger(),
+          "Unknown indicator_light_mode '%s'. Valid: off, red, red_flashing, green",
+          indicator_light_mode_.c_str());
+        ok = false;
+      }
+      if (ok)
+      {
+        PropertyExtension p;
+        p.indicatorLightMode = mode;
+        set_ext(PROPERTY_EXT_INDICATOR_LIGHT_MODE, p, "indicator light mode");
       }
     }
   }
 
-  void handle_frame_pair(cs::IFramePtr frame_dep, cs::IFramePtr frame_rgb)
+  /// RGB sensor controls. The driver previously exposed depth exposure/gain only.
+  void configure_rgb_controls()
   {
-    // 1. Update internal health monitoring first
-    auto now_system = std::chrono::steady_clock::now();
-    int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-      now_system.time_since_epoch()).count();
-    last_frame_time_ns_.store(now_ns);
-    frame_count_.fetch_add(1);
-
-    // 2. Generate a SINGLE timestamp for all messages in this cycle
-    rclcpp::Time stamp = this->get_clock()->now();
-
-    // --- OPTIMIZATION: PUBLISH RGB FIRST FOR MOVEIT ---
-    // MoveIt's Hand-Eye plugin subscribes to the RGB stream. By publishing this 
-    // immediately, we ensure the Image and CameraInfo arrive at Rviz with minimal 
-    // delay, preventing the 'Synchronizer' from dropping the pair.
-    if (frame_rgb && !frame_rgb->empty())
+    if (is_set(rgb_auto_exposure_))
     {
-      sensor_msgs::msg::Image rgb_msg;
-      rgb_msg.header.stamp = stamp;
-      rgb_msg.header.frame_id = rgb_frame_id_;
-      rgb_msg.height = frame_rgb->getHeight();
-      rgb_msg.width = frame_rgb->getWidth();
-      rgb_msg.encoding = sensor_msgs::image_encodings::RGB8;
-      rgb_msg.step = static_cast<uint32_t>(rgb_msg.width * 3);
-      
-      size_t rgb_size = rgb_msg.step * rgb_msg.height;
-      rgb_msg.data.resize(rgb_size);
-      const char * rgb_data = frame_rgb->getData();
-      if (rgb_data) {
-        std::memcpy(rgb_msg.data.data(), rgb_data, rgb_size);
-        
-        // Prepare Info
-        sensor_msgs::msg::CameraInfo rgb_info = rgb_info_msg_;
-        rgb_info.header.stamp = stamp;
-        
-        // Ensure Distortion vector is not empty (MoveIt requirement)
-        if (rgb_info.d.empty()) {
-            rgb_info.d = {0.0, 0.0, 0.0, 0.0, 0.0};
-        }
-
-        // Publish as a tight pair
-        rgb_pub_->publish(rgb_msg);
-        rgb_info_pub_->publish(rgb_info);
-      }
+      set_prop(STREAM_TYPE_RGB, PROPERTY_ENABLE_AUTO_EXPOSURE,
+        rgb_auto_exposure_ != 0 ? 1.0f : 0.0f, "RGB auto exposure");
     }
+    if (is_set(rgb_exposure_us_))
+    {
+      // Dedicated extension property: microseconds, unlike PROPERTY_EXPOSURE
+      // whose units are platform dependent.
+      PropertyExtension p;
+      p.uiExposureTime = static_cast<unsigned int>(rgb_exposure_us_);
+      set_ext(PROPERTY_EXT_EXPOSURE_TIME_RGB, p, "RGB exposure time");
+    }
+    if (is_set(rgb_gain_))
+    {
+      set_prop(STREAM_TYPE_RGB, PROPERTY_GAIN, static_cast<float>(rgb_gain_), "RGB gain");
+    }
+    if (is_set(rgb_auto_white_balance_))
+    {
+      set_prop(STREAM_TYPE_RGB, PROPERTY_ENABLE_AUTO_WHITEBALANCE,
+        rgb_auto_white_balance_ != 0 ? 1.0f : 0.0f, "RGB auto white balance");
+    }
+    if (is_set(rgb_white_balance_))
+    {
+      set_prop(STREAM_TYPE_RGB, PROPERTY_WHITEBALANCE,
+        static_cast<float>(rgb_white_balance_), "RGB white balance");
+    }
+    if (is_set(rgb_auto_focus_))
+    {
+      set_prop(STREAM_TYPE_RGB, PROPERTY_ENABLE_AUTO_FOCUS,
+        rgb_auto_focus_ != 0 ? 1.0f : 0.0f, "RGB auto focus");
+    }
+    if (is_set(rgb_focus_))
+    {
+      set_prop(STREAM_TYPE_RGB, PROPERTY_FOCUS, static_cast<float>(rgb_focus_), "RGB focus");
+    }
+  }
 
-    // --- DEPTH PROCESSING ---
-    if (!frame_dep || frame_dep->empty()) {
+  // ===========================================================================
+  // Services
+  // ===========================================================================
+
+  void create_services()
+  {
+    using std_srvs::srv::Trigger;
+
+    pause_srv_ = create_service<Trigger>("~/pause_stream",
+      [this](const std::shared_ptr<Trigger::Request>,
+             std::shared_ptr<Trigger::Response> res)
+      {
+        std::lock_guard<std::mutex> lock(camera_mutex_);
+        if (!camera_) { res->success = false; res->message = "camera not connected"; return; }
+        const ERROR_CODE ret = camera_->pauseStream(STREAM_TYPE_DEPTH);
+        res->success = (ret == SUCCESS);
+        res->message = res->success ? "depth stream paused"
+                                    : "pauseStream failed (ret=" + std::to_string(ret) + ")";
+        RCLCPP_INFO(get_logger(), "%s", res->message.c_str());
+      });
+
+    resume_srv_ = create_service<Trigger>("~/resume_stream",
+      [this](const std::shared_ptr<Trigger::Request>,
+             std::shared_ptr<Trigger::Response> res)
+      {
+        std::lock_guard<std::mutex> lock(camera_mutex_);
+        if (!camera_) { res->success = false; res->message = "camera not connected"; return; }
+        const ERROR_CODE ret = camera_->resumeStream(STREAM_TYPE_DEPTH);
+        res->success = (ret == SUCCESS);
+        res->message = res->success ? "depth stream resumed"
+                                    : "resumeStream failed (ret=" + std::to_string(ret) + ")";
+        RCLCPP_INFO(get_logger(), "%s", res->message.c_str());
+      });
+
+    // Only meaningful with trigger_mode:=2 (software trigger).
+    soft_trigger_srv_ = create_service<Trigger>("~/soft_trigger",
+      [this](const std::shared_ptr<Trigger::Request>,
+             std::shared_ptr<Trigger::Response> res)
+      {
+        std::lock_guard<std::mutex> lock(camera_mutex_);
+        if (!camera_) { res->success = false; res->message = "camera not connected"; return; }
+        const ERROR_CODE ret = camera_->softTrigger(1);
+        res->success = (ret == SUCCESS);
+        res->message = res->success
+          ? "soft trigger sent"
+          : "softTrigger failed (ret=" + std::to_string(ret) +
+            "); is trigger_mode set to 2 (software)?";
+        RCLCPP_INFO(get_logger(), "%s", res->message.c_str());
+      });
+
+    reset_stats_srv_ = create_service<Trigger>("~/reset_stats",
+      [this](const std::shared_ptr<Trigger::Request>,
+             std::shared_ptr<Trigger::Response> res)
+      {
+        frame_count_.store(0, std::memory_order_relaxed);
+        error_count_.store(0, std::memory_order_relaxed);
+        cloud_dropped_.store(0, std::memory_order_relaxed);
+        last_diag_frame_count_ = 0;
+        res->success = true;
+        res->message = "frame/error/dropped counters reset";
+      });
+  }
+
+  // ===========================================================================
+  // Diagnostics
+  // ===========================================================================
+
+  /// Read a temperature property, returning false if the model lacks it.
+  bool read_temperatures(double & cpu, double & ntc, double & sensor)
+  {
+    bool any = false;
+    PropertyExtension p;
+    if (camera_->getPropertyExtension(PROPERTY_EXT_CPU_TEMPERATURE, p) == SUCCESS)
+    {
+      cpu = static_cast<double>(p.cpuTempratrue);
+      any = true;
+    }
+    PropertyExtension n;
+    if (camera_->getPropertyExtension(PROPERTY_EXT_NTC_TEMPERATURE, n) == SUCCESS &&
+      n.ntcTempratrue.ntcCnt > 0)
+    {
+      ntc = static_cast<double>(n.ntcTempratrue.ntcTemp[0]);
+      any = true;
+    }
+    PropertyExtension t;
+    if (camera_->getPropertyExtension(PROPERTY_EXT_SENSOR_TEMPERATURE, t) == SUCCESS &&
+      t.sensorTempratrue.sensorCnt > 0.0f)
+    {
+      sensor = static_cast<double>(t.sensorTempratrue.sensorTemp[0]);
+      any = true;
+    }
+    return any;
+  }
+
+  static void add_kv(diagnostic_msgs::msg::DiagnosticStatus & st,
+    const std::string & key, const std::string & value)
+  {
+    diagnostic_msgs::msg::KeyValue kv;
+    kv.key = key;
+    kv.value = value;
+    st.values.push_back(kv);
+  }
+
+  /**
+   * @brief Publish measured frame rate, error counters and device temperatures.
+   *
+   * The measured FPS here is the number worth watching: it is counted in the
+   * SDK callback, so it reflects what the camera actually delivered rather than
+   * what any single topic published.
+   */
+  void publish_diagnostics(double measured_fps, double seconds_since_frame)
+  {
+    if (!diagnostics_pub_)
+    {
       return;
     }
 
-    sensor_msgs::msg::Image depth_msg;
-    depth_msg.header.stamp = stamp;
-    depth_msg.header.frame_id = depth_frame_id_;
-    depth_msg.height = frame_dep->getHeight();
-    depth_msg.width = frame_dep->getWidth();
-    depth_msg.encoding = sensor_msgs::image_encodings::TYPE_16UC1;
-    depth_msg.step = static_cast<uint32_t>(depth_msg.width * sizeof(uint16_t));
-    
-    size_t depth_size = depth_msg.step * depth_msg.height;
-    depth_msg.data.resize(depth_size);
-    const char * depth_data = frame_dep->getData(FRAME_DATA_FORMAT_Z16);
-    
-    if (depth_data) {
-      std::memcpy(depth_msg.data.data(), depth_data, depth_size);
+    diagnostic_msgs::msg::DiagnosticStatus st;
+    st.name = std::string(get_name()) + ": stream";
+    st.hardware_id = has_camera_info_ ? last_camera_info_.serial : "unknown";
 
-      // Prepare Depth Info
-      sensor_msgs::msg::CameraInfo depth_info = depth_info_msg_;
-      depth_info.header.stamp = stamp;
+    const uint64_t errors = error_count_.load(std::memory_order_relaxed);
+    const uint64_t dropped = cloud_dropped_.load(std::memory_order_relaxed);
 
-      // 3. Heavy logic (Pointcloud and Scaling) happens AFTER RGB is already on the wire
-      if (publish_pointcloud_ && cloud_pub_) {
-        publish_pointcloud(depth_msg, align_depth_ ? frame_rgb : nullptr);
-      }
-
-      if (depth_scale_sdk_ != 1.0f) {
-        uint16_t * dst = reinterpret_cast<uint16_t *>(depth_msg.data.data());
-        float scale_factor = depth_scale_sdk_;
-        for (size_t i = 0; i < depth_msg.width * depth_msg.height; ++i) {
-          if (dst[i] != 0) {
-            float depth_mm = dst[i] * scale_factor;
-            dst[i] = static_cast<uint16_t>(std::min(depth_mm, 65535.0f));
-          }
-        }
-      }
-
-      depth_pub_->publish(depth_msg);
-      depth_info_pub_->publish(depth_info);
-
-    // Publish colorized depth visualization if enabled
-    if (publish_depth_viz_ && depth_viz_pub_)
+    if (last_frame_time_ns_.load(std::memory_order_relaxed) == 0)
     {
-      sensor_msgs::msg::Image depth_viz_msg;
-      depth_viz_msg.header = depth_msg.header;
-      depth_viz_msg.height = depth_msg.height;
-      depth_viz_msg.width = depth_msg.width;
-      depth_viz_msg.encoding = sensor_msgs::image_encodings::RGB8;
-      depth_viz_msg.is_bigendian = false;
-      depth_viz_msg.step = depth_msg.width * 3;
-      depth_viz_msg.data.resize(depth_viz_msg.step * depth_viz_msg.height);
+      st.level = diagnostic_msgs::msg::DiagnosticStatus::WARN;
+      st.message = "no frames received yet";
+    }
+    else if (seconds_since_frame > frame_timeout_seconds_)
+    {
+      st.level = diagnostic_msgs::msg::DiagnosticStatus::ERROR;
+      st.message = "stream timeout";
+    }
+    else if (seconds_since_frame > half_timeout_seconds_)
+    {
+      st.level = diagnostic_msgs::msg::DiagnosticStatus::WARN;
+      st.message = "stream degraded";
+    }
+    else
+    {
+      st.level = diagnostic_msgs::msg::DiagnosticStatus::OK;
+      st.message = "streaming";
+    }
 
-      const uint16_t * depth_ptr = reinterpret_cast<const uint16_t *>(depth_msg.data.data());
-      uint8_t * viz_ptr = depth_viz_msg.data.data();
+    char buf[64];
+    snprintf(buf, sizeof(buf), "%.2f", measured_fps);
+    add_kv(st, "measured_fps", buf);
+    snprintf(buf, sizeof(buf), "%.1f", depth_stream_info_.fps);
+    add_kv(st, "configured_depth_fps", buf);
+    add_kv(st, "depth_resolution",
+      std::to_string(depth_width_) + "x" + std::to_string(depth_height_));
+    add_kv(st, "rgb_resolution",
+      std::to_string(rgb_width_) + "x" + std::to_string(rgb_height_));
+    add_kv(st, "frames_total",
+      std::to_string(frame_count_.load(std::memory_order_relaxed)));
+    add_kv(st, "errors", std::to_string(errors));
+    add_kv(st, "pointclouds_dropped", std::to_string(dropped));
+    snprintf(buf, sizeof(buf), "%.1f", seconds_since_frame);
+    add_kv(st, "seconds_since_last_frame", buf);
 
-      // Find min/max for normalization
-      uint16_t min_val = 65535, max_val = 0;
-      for (size_t i = 0; i < depth_msg.width * depth_msg.height; ++i) {
-        if (depth_ptr[i] > 0) {
-          min_val = std::min(min_val, depth_ptr[i]);
-          max_val = std::max(max_val, depth_ptr[i]);
-        }
+    double cpu = 0.0, ntc = 0.0, sensor = 0.0;
+    {
+      std::lock_guard<std::mutex> lock(camera_mutex_);
+      if (camera_ && read_temperatures(cpu, ntc, sensor))
+      {
+        snprintf(buf, sizeof(buf), "%.1f", cpu);   add_kv(st, "cpu_temp_c", buf);
+        snprintf(buf, sizeof(buf), "%.1f", ntc);   add_kv(st, "ntc_temp_c", buf);
+        snprintf(buf, sizeof(buf), "%.1f", sensor); add_kv(st, "sensor_temp_c", buf);
       }
+    }
 
-      // Colorize using jet colormap
-      for (size_t i = 0; i < depth_msg.width * depth_msg.height; ++i) {
-        uint16_t val = depth_ptr[i];
-        if (val == 0) {
-          viz_ptr[i * 3 + 0] = 0;
-          viz_ptr[i * 3 + 1] = 0;
-          viz_ptr[i * 3 + 2] = 0;
-        } else {
-          float normalized = (max_val > min_val) ? 
-            static_cast<float>(val - min_val) / (max_val - min_val) : 0.0f;
-          
-          // Simple jet colormap
-          float r, g, b;
-          if (normalized < 0.25f) {
-            r = 0.0f;
-            g = normalized * 4.0f;
-            b = 1.0f;
-          } else if (normalized < 0.5f) {
-            r = 0.0f;
-            g = 1.0f;
-            b = 1.0f - (normalized - 0.25f) * 4.0f;
-          } else if (normalized < 0.75f) {
-            r = (normalized - 0.5f) * 4.0f;
-            g = 1.0f;
-            b = 0.0f;
-          } else {
-            r = 1.0f;
-            g = 1.0f - (normalized - 0.75f) * 4.0f;
-            b = 0.0f;
-          }
-          
-          viz_ptr[i * 3 + 0] = static_cast<uint8_t>(r * 255);
-          viz_ptr[i * 3 + 1] = static_cast<uint8_t>(g * 255);
-          viz_ptr[i * 3 + 2] = static_cast<uint8_t>(b * 255);
-        }
-      }
+    auto msg = std::make_unique<diagnostic_msgs::msg::DiagnosticArray>();
+    msg->header.stamp = this->get_clock()->now();
+    msg->status.push_back(st);
+    diagnostics_pub_->publish(std::move(msg));
+  }
 
-      depth_viz_pub_->publish(depth_viz_msg);
-      }
+  static void frame_pair_callback(cs::IFramePtr frame_dep, cs::IFramePtr frame_rgb, void * user_data)
+  {
+    auto * self = static_cast<RevopointCameraNode *>(user_data);
+    if (!self)
+    {
+      return;
+    }
+    try
+    {
+      self->handle_frame_pair(frame_dep, frame_rgb);
+    }
+    catch (const std::exception & e)
+    {
+      RCLCPP_ERROR(self->get_logger(), "Exception in frame callback: %s", e.what());
+      self->error_count_.fetch_add(1, std::memory_order_relaxed);
+    }
+    catch (...)
+    {
+      RCLCPP_ERROR(self->get_logger(), "Unknown exception in frame callback");
+      self->error_count_.fetch_add(1, std::memory_order_relaxed);
     }
   }
 
-  void publish_pointcloud(const sensor_msgs::msg::Image & depth_msg, cs::IFramePtr frame_rgb)
+  /**
+   * @brief Runs on the SDK's own capture thread.
+   *
+   * Everything here must stay cheap: the SDK does not buffer, so any time spent
+   * in this callback is time the driver is not draining USB, which shows up
+   * directly as lost frames. Image publishing is memcpy-class work and stays
+   * inline; point cloud construction is handed to a worker thread.
+   */
+  void handle_frame_pair(cs::IFramePtr frame_dep, cs::IFramePtr frame_rgb)
   {
-    if (depth_msg.encoding != sensor_msgs::image_encodings::TYPE_16UC1) return;
+    // 1. Health monitoring first, so the watchdog sees liveness even when every
+    //    consumer has unsubscribed and we skip the work below.
+    const auto now_steady = std::chrono::steady_clock::now();
+    last_frame_time_ns_.store(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+        now_steady.time_since_epoch()).count(),
+      std::memory_order_relaxed);
+    frame_count_.fetch_add(1, std::memory_order_relaxed);
 
-    const bool has_rgb_frame = frame_rgb && !frame_rgb->empty();
+    // 2. A single timestamp shared by every message derived from this pair.
+    const rclcpp::Time stamp = this->get_clock()->now();
 
-    // Use SDK's Pointcloud class to generate points with proper color projection
-    cs::Pointcloud pc;
-    const uint16_t * depth_data = reinterpret_cast<const uint16_t *>(depth_msg.data.data());
-    unsigned char * rgb_data = has_rgb_frame ? (unsigned char *)frame_rgb->getData() : nullptr;
-    
-    // Generate points using SDK - it handles all the complex projection internally
-    // SDK expects scale in mm/unit and produces points in mm (verified by PLY output)
-    pc.generatePoints(
-      depth_data,
-      depth_msg.width,
-      depth_msg.height,
-      depth_scale_sdk_,  // mm/unit -> SDK outputs points in mm
-      &depth_intrinsics_,
-      has_rgb_frame ? &rgb_intrinsics_ : nullptr,
-      has_rgb_frame ? &extrinsics_ : nullptr,
-      false  // removeInvalid = false, keep all points
-    );
+    // 3. Lazy publishing: with no subscribers there is nothing to compute. This
+    //    is what keeps an idle driver from burning a core on point clouds.
+    const bool want_rgb = !lazy_publish_ ||
+      rgb_pub_->get_subscription_count() > 0 ||
+      rgb_info_pub_->get_subscription_count() > 0;
+    const bool want_depth_img = !lazy_publish_ ||
+      depth_pub_->get_subscription_count() > 0 ||
+      depth_info_pub_->get_subscription_count() > 0;
+    const bool want_cloud = cloud_pub_ &&
+      (!lazy_publish_ || cloud_pub_->get_subscription_count() > 0);
+    const bool want_viz = depth_viz_pub_ &&
+      (!lazy_publish_ || depth_viz_pub_->get_subscription_count() > 0);
 
-    // Create ROS PointCloud2 message
-    sensor_msgs::msg::PointCloud2 cloud;
-    cloud.header.stamp = depth_msg.header.stamp;
-    cloud.header.frame_id = depth_frame_id_;
-    cloud.height = 1;  // Unordered cloud
-    cloud.width = pc.getVertices().size();
-    cloud.is_dense = false;
+    const bool rgb_valid = frame_rgb && !frame_rgb->empty();
+    const char * rgb_src = rgb_valid ? frame_rgb->getData() : nullptr;
 
-    sensor_msgs::PointCloud2Modifier modifier(cloud);
-    if (has_rgb_frame && !pc.getTexcoords().empty()) {
-      modifier.setPointCloud2Fields(4, "x", 1, sensor_msgs::msg::PointField::FLOAT32,
-                                       "y", 1, sensor_msgs::msg::PointField::FLOAT32,
-                                       "z", 1, sensor_msgs::msg::PointField::FLOAT32,
-                                       "rgb", 1, sensor_msgs::msg::PointField::FLOAT32);
-    } else {
-      modifier.setPointCloud2FieldsByString(1, "xyz");
+    // --- RGB FIRST, FOR MOVEIT ---
+    // MoveIt's hand-eye plugin uses a message_filters synchroniser across the
+    // RGB image and its camera_info; publishing them back-to-back before any
+    // heavy work keeps that pair from being dropped.
+    if (want_rgb && rgb_valid && rgb_src)
+    {
+      auto rgb_msg = std::make_unique<sensor_msgs::msg::Image>();
+      rgb_msg->header.stamp = stamp;
+      rgb_msg->header.frame_id = rgb_frame_id_;
+      rgb_msg->height = frame_rgb->getHeight();
+      rgb_msg->width = frame_rgb->getWidth();
+      rgb_msg->encoding = sensor_msgs::image_encodings::RGB8;
+      rgb_msg->is_bigendian = false;
+      rgb_msg->step = static_cast<uint32_t>(rgb_msg->width * 3);
+
+      const size_t rgb_size = static_cast<size_t>(rgb_msg->step) * rgb_msg->height;
+      // assign() allocates and copies in one pass; resize() would zero-fill
+      // ~5.7 MB first and then have it immediately overwritten.
+      const uint8_t * src = reinterpret_cast<const uint8_t *>(rgb_src);
+      rgb_msg->data.assign(src, src + rgb_size);
+
+      auto rgb_info = std::make_unique<sensor_msgs::msg::CameraInfo>(rgb_info_msg_);
+      rgb_info->header.stamp = stamp;
+      if (rgb_info->d.empty())
+      {
+        rgb_info->d = {0.0, 0.0, 0.0, 0.0, 0.0};
+      }
+
+      rgb_pub_->publish(std::move(rgb_msg));
+      rgb_info_pub_->publish(std::move(rgb_info));
     }
-    modifier.resize(cloud.width);
 
-    // Copy points from SDK to ROS message
-    sensor_msgs::PointCloud2Iterator<float> iter_x(cloud, "x");
-    sensor_msgs::PointCloud2Iterator<float> iter_y(cloud, "y");
-    sensor_msgs::PointCloud2Iterator<float> iter_z(cloud, "z");
-    std::unique_ptr<sensor_msgs::PointCloud2Iterator<float>> iter_rgb;
-    if (has_rgb_frame && !pc.getTexcoords().empty()) {
-      iter_rgb = std::make_unique<sensor_msgs::PointCloud2Iterator<float>>(cloud, "rgb");
+    // --- DEPTH ---
+    if (!frame_dep || frame_dep->empty())
+    {
+      return;
+    }
+    if (!want_depth_img && !want_cloud && !want_viz)
+    {
+      return;
     }
 
-    int colored_count = 0;
-    const auto & points = pc.getVertices();
-    const auto & textures = pc.getTexcoords();
-    
-    for (size_t i = 0; i < points.size(); ++i, ++iter_x, ++iter_y, ++iter_z) {
-      const cs::float3 & pt = points[i];
-      // SDK outputs points in millimeters, convert to meters for ROS
-      *iter_x = pt.x * 0.001f;
-      *iter_y = pt.y * 0.001f;
-      *iter_z = pt.z * 0.001f;
+    const char * depth_src = frame_dep->getData(FRAME_DATA_FORMAT_Z16);
+    if (!depth_src)
+    {
+      return;
+    }
 
-      if (iter_rgb && i < textures.size()) {
-        const cs::float2 & tex = textures[i];
-        // Texture coords are normalized [0,1], convert to pixel coords using pre-computed scale
-        const int tex_x = static_cast<int>(tex.u * tex_scale_x_);
-        const int tex_y = static_cast<int>(tex.v * tex_scale_y_);
+    const uint32_t dw = static_cast<uint32_t>(frame_dep->getWidth());
+    const uint32_t dh = static_cast<uint32_t>(frame_dep->getHeight());
+    const size_t npix = static_cast<size_t>(dw) * dh;
+    const uint16_t * raw = reinterpret_cast<const uint16_t *>(depth_src);
 
-        if (tex_x >= 0 && tex_x < rgb_width_ &&
-            tex_y >= 0 && tex_y < rgb_height_) {
-          const size_t idx = (tex_y * rgb_width_ + tex_x) * 3;
-          
-          // Pack RGB into float (RGB order: R=idx+0, G=idx+1, B=idx+2)
-          const uint32_t rgb_packed = (static_cast<uint32_t>(rgb_data[idx + 0]) << 16) |  // R
-                                      (static_cast<uint32_t>(rgb_data[idx + 1]) << 8) |   // G
-                                      static_cast<uint32_t>(rgb_data[idx + 2]);           // B
-          float rgb_float;
-          std::memcpy(&rgb_float, &rgb_packed, sizeof(float));
-          **iter_rgb = rgb_float;
-          ++colored_count;
-        } else {
-          **iter_rgb = std::numeric_limits<float>::quiet_NaN();
-        }
-        ++(*iter_rgb);
+    // 4. Point cloud is built from RAW depth units, so hand it off BEFORE the
+    //    millimetre rescale below. Getting this order wrong scales the cloud by
+    //    depth_scale twice.
+    if (want_cloud)
+    {
+      // Only hand RGB to the kernel when the frame matches the geometry the
+      // projection constants were built for; otherwise fall back to XYZ-only
+      // rather than indexing the colour buffer with mismatched dimensions.
+      const bool rgb_usable = rgb_src && align_depth_ && rgb_valid &&
+        frame_rgb->getWidth() == rgb_width_ &&
+        frame_rgb->getHeight() == rgb_height_;
+      enqueue_cloud_job(raw, dw, dh,
+        rgb_usable ? reinterpret_cast<const uint8_t *>(rgb_src) : nullptr, stamp);
+    }
+
+    if (!want_depth_img && !want_viz)
+    {
+      return;
+    }
+
+    // 5. Raw units -> millimetres, fused into the copy. One pass over the image
+    //    via a lookup table instead of copy-then-rescale with a float multiply
+    //    and a branch per pixel.
+    auto depth_msg = std::make_unique<sensor_msgs::msg::Image>();
+    depth_msg->header.stamp = stamp;
+    depth_msg->header.frame_id = depth_frame_id_;
+    depth_msg->height = dh;
+    depth_msg->width = dw;
+    depth_msg->encoding = sensor_msgs::image_encodings::TYPE_16UC1;
+    depth_msg->is_bigendian = false;
+    depth_msg->step = static_cast<uint32_t>(dw * sizeof(uint16_t));
+
+    if (depth_mm_lut_identity_ || depth_mm_lut_.empty())
+    {
+      const uint8_t * src = reinterpret_cast<const uint8_t *>(depth_src);
+      depth_msg->data.assign(src, src + npix * sizeof(uint16_t));
+    }
+    else
+    {
+      depth_msg->data.resize(npix * sizeof(uint16_t));
+      uint16_t * dst = reinterpret_cast<uint16_t *>(depth_msg->data.data());
+      const uint16_t * lut = depth_mm_lut_.data();
+      for (size_t i = 0; i < npix; ++i)
+      {
+        dst[i] = lut[raw[i]];
       }
     }
 
-    cloud_pub_->publish(cloud);
+    if (want_viz)
+    {
+      publish_depth_viz(*depth_msg);
+    }
+
+    if (want_depth_img)
+    {
+      auto depth_info = std::make_unique<sensor_msgs::msg::CameraInfo>(depth_info_msg_);
+      depth_info->header.stamp = stamp;
+      depth_pub_->publish(std::move(depth_msg));
+      depth_info_pub_->publish(std::move(depth_info));
+    }
+  }
+
+  /**
+   * @brief Stage a frame pair for the cloud worker, dropping the previous one.
+   *
+   * Latest-frame-wins: if the worker is still busy we overwrite the pending job
+   * rather than queueing, so a slow consumer can never build a backlog or stall
+   * the SDK capture thread.
+   */
+  void enqueue_cloud_job(
+    const uint16_t * depth, uint32_t width, uint32_t height,
+    const uint8_t * rgb, const rclcpp::Time & stamp)
+  {
+    const size_t npix = static_cast<size_t>(width) * height;
+    const size_t rgb_bytes = static_cast<size_t>(rgb_width_) * rgb_height_ * 3;
+
+    if (!pointcloud_async_)
+    {
+      // Synchronous fallback: build inline on the SDK thread.
+      sync_job_.depth.assign(depth, depth + npix);
+      sync_job_.rgb.clear();
+      if (rgb && rgb_bytes > 0)
+      {
+        sync_job_.rgb.assign(rgb, rgb + rgb_bytes);
+      }
+      sync_job_.width = width;
+      sync_job_.height = height;
+      sync_job_.stamp = stamp;
+      build_and_publish_cloud(sync_job_);
+      return;
+    }
+
+    {
+      std::lock_guard<std::mutex> lock(cloud_mutex_);
+      if (cloud_job_pending_)
+      {
+        cloud_dropped_.fetch_add(1, std::memory_order_relaxed);
+      }
+      // assign() reuses the existing capacity, so after the first frame this is
+      // a pure memcpy with no allocation.
+      pending_job_.depth.assign(depth, depth + npix);
+      pending_job_.rgb.clear();
+      if (rgb && rgb_bytes > 0)
+      {
+        pending_job_.rgb.assign(rgb, rgb + rgb_bytes);
+      }
+      pending_job_.width = width;
+      pending_job_.height = height;
+      pending_job_.stamp = stamp;
+      cloud_job_pending_ = true;
+    }
+    cloud_cv_.notify_one();
+  }
+
+  static void add_point_field(
+    sensor_msgs::msg::PointCloud2 & cloud, const char * name, uint32_t offset)
+  {
+    sensor_msgs::msg::PointField f;
+    f.name = name;
+    f.offset = offset;
+    f.datatype = sensor_msgs::msg::PointField::FLOAT32;
+    f.count = 1;
+    cloud.fields.push_back(f);
+  }
+
+  /**
+   * @brief Fused depth -> XYZ(+RGB) projection, written straight into the
+   *        PointCloud2 payload.
+   *
+   * This replaces cs::Pointcloud::generatePoints(), which for a 1600x1200 depth
+   * map did roughly this per frame:
+   *   - two 23 MB malloc/free
+   *   - a projection pass
+   *   - calculateNormals(): two more passes, traversed column-major over a
+   *     row-major array (a ~19 KB stride per access, so effectively one cache
+   *     miss per pixel) producing normals this driver never uses
+   *   - insertPoints(): 1.92M push_backs across three std::vectors
+   * followed, back in this file, by a copy through PointCloud2Iterator.
+   *
+   * Here it is a single cache-friendly pass with no allocation, no normals, and
+   * invalid points dropped instead of emitted as (0,0,0).
+   */
+  void build_and_publish_cloud(const CloudJob & job)
+  {
+    const uint32_t w = job.width;
+    const uint32_t h = job.height;
+    if (w == 0 || h == 0 || job.depth.size() < static_cast<size_t>(w) * h)
+    {
+      return;
+    }
+
+    const bool color = !job.rgb.empty() &&
+      job.rgb.size() >= static_cast<size_t>(rgb_width_) * rgb_height_ * 3;
+
+    auto cloud = std::make_unique<sensor_msgs::msg::PointCloud2>();
+    cloud->header.stamp = job.stamp;
+    cloud->header.frame_id = depth_frame_id_;
+    cloud->height = 1;
+    cloud->is_bigendian = false;
+    // Invalid points are dropped rather than emitted as (0,0,0), so what we
+    // publish contains no invalid entries.
+    cloud->is_dense = true;
+
+    const uint32_t point_step = color ? 16u : 12u;
+    cloud->point_step = point_step;
+    cloud->fields.clear();
+    cloud->fields.reserve(color ? 4 : 3);
+    add_point_field(*cloud, "x", 0);
+    add_point_field(*cloud, "y", 4);
+    add_point_field(*cloud, "z", 8);
+    if (color)
+    {
+      add_point_field(*cloud, "rgb", 12);
+    }
+
+    // Size for the worst case, fill, then shrink. Shrinking a vector never
+    // reallocates, so this costs one allocation instead of growth reallocations.
+    cloud->data.resize(static_cast<size_t>(w) * h * point_step);
+
+    const uint16_t * depth = job.depth.data();
+    const uint8_t * rgb = color ? job.rgb.data() : nullptr;
+    uint8_t * out = cloud->data.data();
+
+    // Hoist every invariant out of the loop.
+    const float unit_to_mm = depth_unit_to_mm_;
+    const float inv_fx = proj_inv_fx_;
+    const float inv_fy = proj_inv_fy_;
+    const float cx = proj_cx_;
+    const float cy = proj_cy_;
+    const float r0 = extrinsics_.rotation[0], r1 = extrinsics_.rotation[1], r2 = extrinsics_.rotation[2];
+    const float r3 = extrinsics_.rotation[3], r4 = extrinsics_.rotation[4], r5 = extrinsics_.rotation[5];
+    const float r6 = extrinsics_.rotation[6], r7 = extrinsics_.rotation[7], r8 = extrinsics_.rotation[8];
+    const float t0 = extrinsics_.translation[0];
+    const float t1 = extrinsics_.translation[1];
+    const float t2 = extrinsics_.translation[2];
+    const float rfx = rgb_fx_, rfy = rgb_fy_, rcx = rgb_cx_, rcy = rgb_cy_;
+    const int rw = rgb_width_;
+    const int rh = rgb_height_;
+
+    uint32_t count = 0;
+    size_t idx = 0;
+
+    for (uint32_t v = 0; v < h; ++v)
+    {
+      const float vy = (static_cast<float>(v) - cy) * inv_fy;
+      for (uint32_t u = 0; u < w; ++u, ++idx)
+      {
+        const uint16_t raw = depth[idx];
+        if (raw == 0)
+        {
+          continue;
+        }
+
+        // Millimetres, matching the SDK's internal convention (extrinsics
+        // translation is in mm, so the RGB projection must happen in mm).
+        const float z = static_cast<float>(raw) * unit_to_mm;
+        const float x = (static_cast<float>(u) - cx) * inv_fx * z;
+        const float y = vy * z;
+
+        float * pt = reinterpret_cast<float *>(out);
+
+        if (color)
+        {
+          // p_rgb = R * (p_depth + T), matching cs::Pointcloud::insertPoints.
+          const float tx = x + t0;
+          const float ty = y + t1;
+          const float tz = z + t2;
+          const float px = tx * r0 + ty * r1 + tz * r2;
+          const float py = tx * r3 + ty * r4 + tz * r5;
+          const float pz = tx * r6 + ty * r7 + tz * r8;
+          if (pz <= 0.0f)
+          {
+            continue;
+          }
+          const float inv_pz = 1.0f / pz;
+          const int fu = static_cast<int>(rfx * px * inv_pz + rcx);
+          const int fv = static_cast<int>(rfy * py * inv_pz + rcy);
+          if (fu < 0 || fu >= rw || fv < 0 || fv >= rh)
+          {
+            continue;
+          }
+          const size_t c = (static_cast<size_t>(fv) * rw + fu) * 3;
+          const uint32_t packed =
+            (static_cast<uint32_t>(rgb[c + 0]) << 16) |   // R
+            (static_cast<uint32_t>(rgb[c + 1]) << 8) |    // G
+            static_cast<uint32_t>(rgb[c + 2]);            // B
+          std::memcpy(pt + 3, &packed, sizeof(uint32_t));
+        }
+
+        // SDK works in mm; ROS wants metres.
+        pt[0] = x * 0.001f;
+        pt[1] = y * 0.001f;
+        pt[2] = z * 0.001f;
+
+        out += point_step;
+        ++count;
+      }
+    }
+
+    cloud->width = count;
+    cloud->row_step = count * point_step;
+    cloud->data.resize(static_cast<size_t>(count) * point_step);
+
+    cloud_pub_->publish(std::move(cloud));
+  }
+
+  void publish_depth_viz(const sensor_msgs::msg::Image & depth_msg)
+  {
+    auto viz = std::make_unique<sensor_msgs::msg::Image>();
+    viz->header = depth_msg.header;
+    viz->height = depth_msg.height;
+    viz->width = depth_msg.width;
+    viz->encoding = sensor_msgs::image_encodings::RGB8;
+    viz->is_bigendian = false;
+    viz->step = depth_msg.width * 3;
+    viz->data.resize(static_cast<size_t>(viz->step) * viz->height);
+
+    const size_t npix = static_cast<size_t>(depth_msg.width) * depth_msg.height;
+    const uint16_t * src = reinterpret_cast<const uint16_t *>(depth_msg.data.data());
+    uint8_t * dst = viz->data.data();
+
+    uint16_t min_val = 65535;
+    uint16_t max_val = 0;
+    for (size_t i = 0; i < npix; ++i)
+    {
+      const uint16_t v = src[i];
+      if (v > 0)
+      {
+        min_val = std::min(min_val, v);
+        max_val = std::max(max_val, v);
+      }
+    }
+
+    // Scale into the 256-entry jet table instead of recomputing the colormap
+    // branches and float multiplies per pixel.
+    const float span = (max_val > min_val)
+      ? 255.0f / static_cast<float>(max_val - min_val) : 0.0f;
+    const uint8_t * lut = jet_lut_.data();
+
+    for (size_t i = 0; i < npix; ++i)
+    {
+      const uint16_t v = src[i];
+      if (v == 0)
+      {
+        dst[i * 3 + 0] = 0;
+        dst[i * 3 + 1] = 0;
+        dst[i * 3 + 2] = 0;
+        continue;
+      }
+      const int bin = static_cast<int>(static_cast<float>(v - min_val) * span);
+      const size_t c = static_cast<size_t>(std::min(std::max(bin, 0), 255)) * 3;
+      dst[i * 3 + 0] = lut[c + 0];
+      dst[i * 3 + 1] = lut[c + 1];
+      dst[i * 3 + 2] = lut[c + 2];
+    }
+
+    depth_viz_pub_->publish(std::move(viz));
   }
 
   std::string serial_;
@@ -1551,11 +2394,81 @@ private:
   float depth_scale_ = 1.0f;  // Depth scale in meters/unit (for ROS)
   float depth_scale_sdk_ = 0.1f;  // Depth scale in mm/unit (for SDK generatePoints)
 
-  // Pre-computed RGB stream parameters (set once at stream start)
+  // Stream geometry, cached once at stream start.
   int rgb_width_ = 0;
   int rgb_height_ = 0;
-  float tex_scale_x_ = 0.0f;
-  float tex_scale_y_ = 0.0f;
+  int depth_width_ = 0;
+  int depth_height_ = 0;
+
+  // Pre-computed point cloud projection constants (see
+  // initialize_projection_parameters). Reciprocals are stored so the per-pixel
+  // kernel contains no divisions.
+  float proj_inv_fx_ = 0.0f;
+  float proj_inv_fy_ = 0.0f;
+  float proj_cx_ = 0.0f;
+  float proj_cy_ = 0.0f;
+  float rgb_fx_ = 0.0f;
+  float rgb_fy_ = 0.0f;
+  float rgb_cx_ = 0.0f;
+  float rgb_cy_ = 0.0f;
+  float depth_unit_to_mm_ = 0.1f;
+
+  // Raw depth unit -> millimetre table for the published 16UC1 image.
+  std::vector<uint16_t> depth_mm_lut_;
+  bool depth_mm_lut_identity_ = false;
+  // 256-entry jet colormap for the optional depth visualisation.
+  std::vector<uint8_t> jet_lut_;
+
+  // Point cloud worker: the SDK capture thread stages a job, this thread builds
+  // and publishes the cloud. Latest-frame-wins, never blocks the producer.
+  std::thread cloud_thread_;
+  std::mutex cloud_mutex_;
+  std::condition_variable cloud_cv_;
+  CloudJob pending_job_;
+  CloudJob sync_job_;
+  bool cloud_job_pending_ = false;
+  bool cloud_stop_ = false;
+  std::atomic<uint64_t> cloud_dropped_{0};
+
+  int qos_depth_ = 2;
+  bool lazy_publish_ = true;
+  bool pointcloud_async_ = true;
+
+  // Additional SDK capabilities. -1 / "" / empty means "leave device default".
+  std::string hdr_mode_;
+  std::vector<int64_t> hdr_scale_;
+  int depth_filter_level_ = -1;
+  std::vector<int64_t> depth_roi_;
+  std::vector<int64_t> rgb_roi_;
+  int multiframe_fusion_ = -1;
+  int fast_scan_mode_ = -1;
+  int hardware_sync_ = -1;
+  int trigger_out_enable_ = -1;
+  int trigger_in_mode_ = -1;
+  std::string indicator_light_mode_;
+  double max_frame_time_us_ = -1.0;
+  double max_gain_ = -1.0;
+
+  double rgb_exposure_us_ = -1.0;
+  int rgb_auto_exposure_ = -1;
+  int rgb_auto_white_balance_ = -1;
+  double rgb_white_balance_ = -1.0;
+  double rgb_gain_ = -1.0;
+  int rgb_auto_focus_ = -1;
+  double rgb_focus_ = -1.0;
+
+  // Guards camera_ against concurrent use by service callbacks, the diagnostics
+  // timer and shutdown. The frame callback never touches camera_.
+  std::mutex camera_mutex_;
+
+  bool publish_diagnostics_ = true;
+  rclcpp::Publisher<diagnostic_msgs::msg::DiagnosticArray>::SharedPtr diagnostics_pub_;
+  rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr pause_srv_;
+  rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr resume_srv_;
+  rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr soft_trigger_srv_;
+  rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr reset_stats_srv_;
+  uint64_t last_diag_frame_count_ = 0;
+  std::chrono::steady_clock::time_point last_diag_time_{};
 
   Intrinsics depth_intrinsics_{};
   Intrinsics rgb_intrinsics_{};
@@ -1596,7 +2509,11 @@ private:
 int main(int argc, char ** argv)
 {
   rclcpp::init(argc, argv);
-  auto node = std::make_shared<revopoint_camera::RevopointCameraNode>();
+  rclcpp::NodeOptions options;
+  // Lets any subscriber composed into this process receive the published
+  // unique_ptr messages without a serialise/copy round trip.
+  options.use_intra_process_comms(true);
+  auto node = std::make_shared<revopoint_camera::RevopointCameraNode>(options);
   rclcpp::spin(node);
   rclcpp::shutdown();
   return 0;
